@@ -1,0 +1,21 @@
+doc_root: "/Volumes/documents/TextSync"          # change to your mounted SMB path
+include_ext: [".md", ".txt"]
+
+data_dir: "/Users/kspringall/code/notes_bot/data"
+index_dir: "/Users/kspringall/code/notes_bot/data/chroma"
+manifest_path: "/Users/kspringall/code/notes_bot/data/manifest.sqlite"
+chat_history_path: "/Users/kspringall/code/notes_bot/data/chat_history.jsonl"
+
+chunk_chars: 4000
+chunk_overlap: 500
+top_k: 10
+
+scan_interval_minutes: 15
+
+embedding_model: "text-embedding-3-small"
+chat_model: "gpt-5.2"
+
+max_history_turns: 12
+max_sources_chars: 35000
+max_file_size_mb: 8
+max_chunks_per_file: 2000
