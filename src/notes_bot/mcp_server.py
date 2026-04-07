@@ -399,11 +399,11 @@ class NotesMCPServer:
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             "reindex_now": {
-                "description": "Run incremental reindex immediately. If wait=false, starts async when idle.",
+                "description": "Run incremental reindex immediately. Starts async when idle by default; use wait=true to block until finished.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "wait": {"type": "boolean", "default": True},
+                        "wait": {"type": "boolean", "default": False},
                         "lock_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 300},
                     },
                     "additionalProperties": False,
@@ -598,7 +598,7 @@ class NotesMCPServer:
             return _tool_ok(st)
 
         if name == "reindex_now":
-            wait = bool(a.get("wait", True))
+            wait = bool(a.get("wait", False))
             timeout = max(1, min(86400, int(a.get("lock_timeout_seconds", 300))))
 
             if wait:

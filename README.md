@@ -48,16 +48,15 @@ notes_bot/
 From project root:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install openai chromadb pyyaml
+python -m venv venv
+venv\Scripts\python.exe -m pip install --upgrade pip
+venv\Scripts\python.exe -m pip install openai chromadb pyyaml
 ```
 
 Set your API key:
 
-```bash
-export OPENAI_API_KEY="your_key_here"
+```powershell
+$env:OPENAI_API_KEY="your_key_here"
 ```
 
 ## Configure
@@ -73,14 +72,19 @@ Edit `config.yaml`:
 
 Current default data paths are project-local under:
 
-`/Users/kspringall/code/notes_bot/data`
+`./data`
+
+The checked-in `config.yaml` is currently set to:
+
+- `doc_root: Y:\TextSync`
+- project-local writable state under `./data`
 
 ## Run
 
 From project root:
 
 ```bash
-./venv/bin/python run_chat.py
+venv\Scripts\python.exe run_chat.py
 ```
 
 ## MCP Server
@@ -88,13 +92,13 @@ From project root:
 This repo also includes a full MCP server over stdio:
 
 ```bash
-./venv/bin/python run_mcp.py
+venv\Scripts\python.exe run_mcp.py
 ```
 
 Optional flags:
 
 ```bash
-./venv/bin/python run_mcp.py --config config.yaml --no-background-index
+venv\Scripts\python.exe run_mcp.py --config config.yaml --no-background-index
 ```
 
 Exposed MCP tools:
@@ -108,6 +112,8 @@ Exposed MCP tools:
 - `answer_from_notes`
 - `list_large_files`
 
+`reindex_now` is asynchronous by default for MCP clients. Call `reindex_status` to poll progress, or pass `{"wait": true}` if you explicitly want a blocking reindex run.
+
 Exposed MCP resources:
 
 - `notes://manifest`
@@ -118,17 +124,12 @@ Exposed MCP prompts:
 
 - `grounded_note_answer`
 
-Example MCP client entry:
+Example Codex MCP entry:
 
-```json
-{
-  "mcpServers": {
-    "notes_bot": {
-      "command": "/Users/kspringall/code/notes_bot/venv/bin/python",
-      "args": ["/Users/kspringall/code/notes_bot/run_mcp.py", "--config", "/Users/kspringall/code/notes_bot/config.yaml"]
-    }
-  }
-}
+```toml
+[mcp_servers.notes_bot]
+command = 'C:\Users\kspringall\code\notes_bot\venv\Scripts\python.exe'
+args = ['C:\Users\kspringall\code\notes_bot\run_mcp.py', '--config', 'C:\Users\kspringall\code\notes_bot\config.yaml']
 ```
 
 ## Commands
