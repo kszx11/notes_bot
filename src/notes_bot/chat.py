@@ -27,6 +27,18 @@ HELP_TEXT = (
     "- /exit quit\n"
 )
 
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+_URL_RE = re.compile(r"\bhttps?://[^\s<>'\"`]+")
+_CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+_API_KEY_RE_LIST = [
+    re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),               # OpenAI-style
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                  # AWS access key id
+    re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),            # Google API key
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),      # Slack tokens
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),        # GitHub tokens
+]
+
 
 def _read_note_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
@@ -227,6 +239,129 @@ def _extract_mention_term(user_text: str) -> tuple[str, str] | None:
     return None
 
 
+def _count_ipv4_addresses(text: str) -> tuple[int, int]:
+    total = 0
+    unique: set[str] = set()
+    for m in _IPV4_RE.finditer(text):
+        ip = m.group(0)
+        parts = ip.split(".")
+        if len(parts) != 4:
+            continue
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            continue
+        if any(n < 0 or n > 255 for n in nums):
+            continue
+        total += 1
+        unique.add(ip)
+    return total, len(unique)
+
+
+def _count_emails(text: str) -> tuple[int, int]:
+    matches = [m.group(0) for m in _EMAIL_RE.finditer(text)]
+    unique = {m.lower() for m in matches}
+    return len(matches), len(unique)
+
+
+def _count_urls(text: str) -> tuple[int, int]:
+    matches = []
+    for m in _URL_RE.finditer(text):
+        url = m.group(0).rstrip(".,;:!?)]}")
+        if url:
+            matches.append(url)
+    unique = set(matches)
+    return len(matches), len(unique)
+
+
+def _count_api_key_like(text: str) -> tuple[int, int]:
+    matches: list[str] = []
+    for rx in _API_KEY_RE_LIST:
+        matches.extend(m.group(0) for m in rx.finditer(text))
+    unique = set(matches)
+    return len(matches), len(unique)
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    alt = False
+    for ch in reversed(digits):
+        d = ord(ch) - ord("0")
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        alt = not alt
+    return (total % 10) == 0
+
+
+def _count_credit_card_like(text: str) -> tuple[int, int]:
+    normalized: list[str] = []
+    for m in _CARD_CANDIDATE_RE.finditer(text):
+        raw = m.group(0)
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) < 13 or len(digits) > 19:
+            continue
+        if _luhn_ok(digits):
+            normalized.append(digits)
+    unique = set(normalized)
+    return len(normalized), len(unique)
+
+
+def _is_density_question(low: str) -> bool:
+    asks_files = "which file" in low or "what file" in low or "which files" in low or "what files" in low
+    asks_density = any(p in low for p in ("a lot", "lots", "many", "most", "highest", "top"))
+    return asks_files and asks_density
+
+
+def _detect_analytic_target(user_text: str) -> str | None:
+    low = user_text.lower()
+    if not _is_density_question(low):
+        return None
+    if "ip address" in low or "ip addresses" in low or re.search(r"\bips?\b", low):
+        return "ip"
+    if "email address" in low or "email addresses" in low or re.search(r"\bemails?\b", low):
+        return "email"
+    if re.search(r"\burls?\b", low) or re.search(r"\blinks?\b", low) or re.search(r"\bwebsites?\b", low):
+        return "url"
+    if "api key" in low or "api keys" in low or "access key" in low or "access keys" in low:
+        return "api_key"
+    if "credit card" in low or "card number" in low or "card numbers" in low:
+        return "credit_card"
+    return None
+
+
+def _format_analytic_density_results(cfg, manifest: Manifest, target: str, max_items: int = 10) -> str:
+    analyzers = {
+        "ip": ("IPv4 address", _count_ipv4_addresses),
+        "email": ("email address", _count_emails),
+        "url": ("URL", _count_urls),
+        "api_key": ("API-key-like string", _count_api_key_like),
+        "credit_card": ("credit-card-like number", _count_credit_card_like),
+    }
+    label, counter = analyzers[target]
+    rows: list[tuple[str, int, int]] = []
+    for rel_path in _list_indexed_files(manifest):
+        abs_path = cfg.doc_root / rel_path
+        if not abs_path.exists() or not abs_path.is_file():
+            continue
+        total, unique = counter(_read_note_text(abs_path))
+        if total > 0:
+            rows.append((rel_path, total, unique))
+
+    if not rows:
+        return f"No indexed files contain {label}s."
+
+    rows.sort(key=lambda x: (x[1], x[2], x[0]), reverse=True)
+    shown = rows[:max_items]
+    lines = [f"Top files by {label} count ({len(rows)} file(s) with at least one match):"]
+    lines.extend(f"- {rel_path}: {total} match(es), {unique} unique" for rel_path, total, unique in shown)
+    if len(rows) > max_items:
+        lines.append(f"... ({len(rows) - max_items} more)")
+    return "\n".join(lines)
+
+
 def _handle_meta_query(user_text: str, cfg, manifest: Manifest) -> str | None:
     text = user_text.strip()
     low = text.lower()
@@ -242,6 +377,10 @@ def _handle_meta_query(user_text: str, cfg, manifest: Manifest) -> str | None:
     if any(p in low for p in indexed_phrases):
         files = _list_indexed_files(manifest)
         return _format_indexed_files(files)
+
+    analytic_target = _detect_analytic_target(text)
+    if analytic_target:
+        return _format_analytic_density_results(cfg, manifest, analytic_target)
 
     mention = _extract_mention_term(text)
     if mention:

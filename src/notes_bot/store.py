@@ -23,7 +23,8 @@ class VectorStore:
         return self.col.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
-            include=["documents", "metadatas", "distances", "ids"],
+            # Chroma query no longer accepts "ids" in include; ids are still returned.
+            include=["documents", "metadatas", "distances"],
         )
 
         
