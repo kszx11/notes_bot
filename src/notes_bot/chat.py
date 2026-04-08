@@ -31,6 +31,12 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 _URL_RE = re.compile(r"\bhttps?://[^\s<>'\"`]+")
 _CARD_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+_SQL_BLOCK_RE = re.compile(
+    r"(?is)(?:^|[;\n])\s*((?:select|insert|update|delete|create|alter|drop|truncate|merge|with)\b[\s\S]{1,1200}?;)"
+)
+_SQL_LINE_RE = re.compile(
+    r"(?im)^\s*(select|insert|update|delete|create|alter|drop|truncate|merge|with)\b[^\n;]{6,}$"
+)
 _API_KEY_RE_LIST = [
     re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),               # OpenAI-style
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                  # AWS access key id
@@ -309,6 +315,34 @@ def _count_credit_card_like(text: str) -> tuple[int, int]:
     return len(normalized), len(unique)
 
 
+def _normalize_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql.strip()).lower()
+
+
+def _count_sql_statements(text: str) -> tuple[int, int]:
+    matches: list[str] = []
+
+    # Multi-line / block SQL ending in semicolon.
+    for m in _SQL_BLOCK_RE.finditer(text):
+        stmt = m.group(1).strip()
+        low = stmt.lower()
+        if low.startswith(("select", "with")) and " from " not in low:
+            continue
+        matches.append(stmt)
+
+    # One-line SQL commands without semicolon.
+    for m in _SQL_LINE_RE.finditer(text):
+        stmt = m.group(0).strip()
+        low = stmt.lower()
+        if low.startswith(("select", "with")) and " from " not in low:
+            continue
+        matches.append(stmt)
+
+    normalized = [_normalize_sql(s) for s in matches if s]
+    unique = set(normalized)
+    return len(normalized), len(unique)
+
+
 def _is_density_question(low: str) -> bool:
     asks_files = "which file" in low or "what file" in low or "which files" in low or "what files" in low
     asks_density = any(p in low for p in ("a lot", "lots", "many", "most", "highest", "top"))
@@ -329,6 +363,10 @@ def _detect_analytic_target(user_text: str) -> str | None:
         return "api_key"
     if "credit card" in low or "card number" in low or "card numbers" in low:
         return "credit_card"
+    if "sql" in low or "sql query" in low or "sql queries" in low or "sql statement" in low or "sql statements" in low:
+        return "sql"
+    if "query" in low or "queries" in low or "statement" in low or "statements" in low:
+        return "sql"
     return None
 
 
@@ -339,6 +377,7 @@ def _format_analytic_density_results(cfg, manifest: Manifest, target: str, max_i
         "url": ("URL", _count_urls),
         "api_key": ("API-key-like string", _count_api_key_like),
         "credit_card": ("credit-card-like number", _count_credit_card_like),
+        "sql": ("SQL statement", _count_sql_statements),
     }
     label, counter = analyzers[target]
     rows: list[tuple[str, int, int]] = []
