@@ -1,0 +1,167 @@
+[
+  {
+    "query": "find my note about docker",
+    "expected_paths": [
+      "Docker.txt"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "Filename-oriented sanity check."
+  },
+  {
+    "query": "notes with sql in the title",
+    "expected_paths": [
+      "SQL Dev.txt"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "Should exercise filename/title weighting."
+  },
+  {
+    "query": "find my note about nextcloud",
+    "expected_paths": [
+      "nextcloud commands.txt"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "Simple filename recall."
+  },
+  {
+    "query": "where did I mention pipelines and QA",
+    "expected_paths": [
+      "Pipelines and QA.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "pipelines",
+      "qa"
+    ],
+    "notes": "Phrase-heavy snippet search."
+  },
+  {
+    "query": "find the note about proton email",
+    "expected_paths": [
+      "Proton Email Domain Transfer.txt"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "Mixed semantic and filename recall."
+  },
+  {
+    "query": "which file talks about route rules",
+    "expected_paths": [
+      "Route Rules.txt"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "File-discovery wording."
+  },
+  {
+    "query": "show my note about priesthood",
+    "expected_paths": [
+      "Priesthood.md"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "Single-word title lookup."
+  },
+  {
+    "query": "find the note about the book of the dead",
+    "expected_paths": [
+      "The Book of the Dead.txt"
+    ],
+    "expected_query_type": "filename_focus",
+    "notes": "Longer exact title phrase."
+  },
+  {
+    "query": "where did I mention network host mode",
+    "expected_paths": [
+      "Docker.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "network",
+      "host"
+    ],
+    "notes": "Snippet should come from the docker networking section."
+  },
+  {
+    "query": "where did I note automation coverage plan",
+    "expected_paths": [
+      "Pipelines and QA.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "automation",
+      "coverage",
+      "plan"
+    ],
+    "notes": "Tests snippet extraction around a checklist item."
+  },
+  {
+    "query": "where did I say switch to springall.xyz",
+    "expected_paths": [
+      "Proton Email Domain Transfer.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "switch",
+      "springall.xyz"
+    ],
+    "notes": "Should land on the domain migration section."
+  },
+  {
+    "query": "where did I mention check dynamodb",
+    "expected_paths": [
+      "Route Rules.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "check",
+      "dynamodb"
+    ],
+    "notes": "Snippet should come from the TODO checklist."
+  },
+  {
+    "query": "where did I note restart apache2.service",
+    "expected_paths": [
+      "nextcloud commands.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "restart",
+      "apache2.service"
+    ],
+    "notes": "Snippet should come from the IP address edit instructions."
+  },
+  {
+    "query": "where did I mention invoke page",
+    "expected_paths": [
+      "SQL Dev.txt"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "invoke",
+      "page"
+    ],
+    "notes": "Should land near the environment links section."
+  },
+  {
+    "query": "how can QA engineers use Docker",
+    "expected_paths": [
+      "Docker in QA.md"
+    ],
+    "expected_query_type": "mixed",
+    "expected_snippet_terms": [
+      "qa",
+      "docker"
+    ],
+    "notes": "Broader concept query against a conversational note."
+  },
+  {
+    "query": "where did I describe melchizedek priesthood",
+    "expected_paths": [
+      "Priesthood.md"
+    ],
+    "expected_query_type": "snippet_focus",
+    "expected_snippet_terms": [
+      "melchizedek",
+      "priesthood"
+    ],
+    "notes": "Should extract the section heading and nearby lines."
+  }
+]

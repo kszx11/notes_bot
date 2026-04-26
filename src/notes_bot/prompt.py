@@ -1,5 +1,7 @@
 import re
 
+GENERAL_CHAT_PROMPT = """You are a helpful assistant."""
+
 SYSTEM_PROMPT = """You are a notes assistant. You must follow these rules:
 
 GROUNDING

@@ -1,10 +1,10 @@
-doc_root: "/Volumes/documents/TextSync"          # change to your mounted SMB path
+doc_root: "/home/kspringall/omv-documents/TextSync"          # change to your mounted SMB path
 include_ext: [".md", ".txt"]
 
-data_dir: "/Users/kspringall/code/notes_bot/data"
-index_dir: "/Users/kspringall/code/notes_bot/data/chroma"
-manifest_path: "/Users/kspringall/code/notes_bot/data/manifest.sqlite"
-chat_history_path: "/Users/kspringall/code/notes_bot/data/chat_history.jsonl"
+data_dir: "/home/kspringall/code/notes_bot/data"
+index_dir: "/home/kspringall/code/notes_bot/data/chroma"
+manifest_path: "/home/kspringall/code/notes_bot/data/manifest.sqlite"
+chat_history_path: "/home/kspringall/code/notes_bot/data/chat_history.jsonl"
 
 chunk_chars: 4000
 chunk_overlap: 500

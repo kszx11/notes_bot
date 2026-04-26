@@ -11,6 +11,9 @@ from .scanner import iter_files, DiscoveredFile
 from .chunker import chunk_with_line_ranges
 from .store import VectorStore
 
+INDEX_SCHEMA_VERSION = "2"
+
+
 @dataclass
 class IndexStats:
     scanned: int = 0
@@ -31,6 +34,29 @@ def _embed_texts(client: OpenAI, model: str, texts: list[str]) -> list[list[floa
     resp = client.embeddings.create(model=model, input=texts)
     return [d.embedding for d in resp.data]
 
+
+def _extract_heading_context(lines: list[str], start_line: int) -> str | None:
+    if start_line <= 1:
+        search_end = 0
+    else:
+        search_end = min(len(lines), start_line - 1)
+
+    for idx in range(search_end - 1, -1, -1):
+        stripped = lines[idx].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or None
+    return None
+
+
+def _extract_first_nonempty_line(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:200]
+    return None
+
 def run_index_once(
     *,
     client: OpenAI,
@@ -44,26 +70,40 @@ def run_index_once(
     batch_size: int = 96,
     max_file_size_mb: int = 8,
     max_chunks_per_file: int = 2000,
+    force_reindex: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> IndexStats:
     stats = IndexStats()
     seen_paths: set[str] = set()
     files = list(iter_files(doc_root, include_ext))
     total_files = len(files)
+    stored_schema_version = manifest.get_meta("index_schema_version")
+    schema_force_reindex = stored_schema_version != INDEX_SCHEMA_VERSION
+    effective_force_reindex = force_reindex or schema_force_reindex
+
+    if effective_force_reindex and progress_callback:
+        progress_callback({
+            "phase": "schema_upgrade",
+            "reason": "schema_upgrade" if schema_force_reindex else "manual_force",
+            "old_version": stored_schema_version or "unset",
+            "new_version": INDEX_SCHEMA_VERSION,
+            "total_files": total_files,
+        })
 
     for idx, f in enumerate(files, start=1):
         stats.scanned += 1
         seen_paths.add(f.rel_path)
 
         prev = manifest.get(f.rel_path)
-        changed = (prev is None) or (prev.mtime != f.mtime) or (prev.size != f.size)
+        changed = effective_force_reindex or (prev is None) or (prev.mtime != f.mtime) or (prev.size != f.size)
         if progress_callback:
             progress_callback({
                 "phase": "scan",
                 "index": idx,
                 "total": total_files,
                 "rel_path": f.rel_path,
-                "status": "updating" if changed else "unchanged",
+                "status": "reindex_all" if effective_force_reindex else ("updating" if changed else "unchanged"),
+                "mode": "full" if effective_force_reindex else "incremental",
                 "stats": stats,
             })
         if not changed:
@@ -96,6 +136,7 @@ def run_index_once(
                 continue
 
             text = _read_text(f.abs_path)
+            lines = text.splitlines()
             if progress_callback:
                 progress_callback({
                     "phase": "file",
@@ -172,14 +213,20 @@ def run_index_once(
             batch_no = 0
 
             for ch in chunks:
+                heading = _extract_heading_context(lines, ch.start_line)
+                first_line = _extract_first_nonempty_line(ch.text)
                 batch_ids.append(_stable_chunk_id(f.rel_path, f.mtime, ch.chunk_index))
                 batch_texts.append(ch.text)
                 batch_metas.append({
                     "rel_path": f.rel_path,
+                    "basename": f.abs_path.name,
+                    "stem": f.abs_path.stem,
                     "start_line": ch.start_line,
                     "end_line": ch.end_line,
                     "chunk_index": ch.chunk_index,
                     "mtime": f.mtime,
+                    "heading": heading,
+                    "first_line": first_line,
                 })
                 if len(batch_texts) < batch_size:
                     continue
@@ -279,7 +326,12 @@ def run_index_once(
             "stats": stats,
             "total_files": total_files,
             "deleted_total": len(missing_list),
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "force_reindex": effective_force_reindex,
         })
+
+    if stats.errors == 0:
+        manifest.set_meta("index_schema_version", INDEX_SCHEMA_VERSION)
 
     return stats
     

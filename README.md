@@ -3,22 +3,25 @@
 A local notes RAG assistant that:
 - indexes `.md` and `.txt` files from a configured notes directory
 - stores embeddings in ChromaDB
-- answers questions using only retrieved source snippets
-- supports file discovery/search commands for indexed content
+- supports natural-language note search across file names and note content
+- supports general world-knowledge chat when the prompt is not about your notes
 
 ## Features
 
 - Incremental background indexing
 - Manual reindex command
-- Grounded answers with citation validation
+- Natural-language routing between note search and general chat
 - Chat history persistence
-- File search by filename and/or file text
+- Ranked search results with file paths and snippets
+- Chunk metadata includes file/title context to improve vague searches after reindexing
 
 ## Project Layout
 
 ```text
 notes_bot/
   run_chat.py
+  run_eval_candidates.py
+  run_eval_promote.py
   config.yaml
   src/notes_bot/
     chat.py
@@ -110,7 +113,18 @@ Exposed MCP tools:
 - `reindex_status`
 - `reindex_now`
 - `answer_from_notes`
+- `route_query`
+- `query_notes`
+- `chat`
+- `eval_candidates`
+- `eval_promote`
 - `list_large_files`
+
+Legacy MCP compatibility tools still exposed:
+
+- `find_files`
+- `search_notes`
+- `answer_from_notes`
 
 `reindex_now` is asynchronous by default for MCP clients. Call `reindex_status` to poll progress, or pass `{"wait": true}` if you explicitly want a blocking reindex run.
 
@@ -136,25 +150,94 @@ args = ['C:\Users\kspringall\code\notes_bot\run_mcp.py', '--config', 'C:\Users\k
 
 - `/clear` clear chat context/history
 - `/reindex` run incremental indexing now
+- `/reindex-force` rebuild the entire index now
+- `/reindex-status` show current indexer status
 - `/indexed` list indexed files from manifest
-- `/find <term>` search indexed files by filename or text
-- `/findname <term>` search filename only
-- `/findtext <term>` search text content only
 - `/exit` quit
+
+## Eval Runner
+
+Run local search evals against your current index:
+
+```bash
+python run_eval.py
+```
+
+Optional arguments:
+
+```bash
+python run_eval.py data/eval_queries.json 8
+```
+
+Generate candidate eval cases from real `notes_search` usage:
+
+```bash
+python run_eval_candidates.py
+```
+
+Optional arguments:
+
+```bash
+python run_eval_candidates.py data/eval_candidates.json 40
+```
+
+Promote reviewed candidates into the main eval file:
+
+```bash
+python run_eval_promote.py 1 2 5-8
+```
+
+Promote all candidates:
+
+```bash
+python run_eval_promote.py all
+```
+
+The starter eval file lives at:
+
+`data/eval_queries.json`
+
+Edit it with real queries you care about and the expected `rel_path` values you want to see in the top results.
+
+Optional eval fields per case:
+
+- `expected_query_type`: `filename_focus`, `snippet_focus`, or `mixed`
+- `expected_snippet_terms`: list of lowercase terms you expect to appear in a matching snippet
+
+Example:
+
+```json
+{
+  "query": "where did I mention pipelines and QA",
+  "expected_paths": ["Pipelines and QA.txt"],
+  "expected_query_type": "snippet_focus",
+  "expected_snippet_terms": ["pipelines", "qa"]
+}
+```
+
+Candidate generation workflow:
+
+- normal note searches are logged to `data/search_queries.jsonl`
+- `python run_eval_candidates.py` reads that log
+- it skips queries already present in `data/eval_queries.json`
+- it writes a deduped seed file you can review and promote into the main eval set
+- `python run_eval_promote.py 1 2 5-8` promotes selected candidate indexes into `data/eval_queries.json`
+- promoted candidates are removed from `data/eval_candidates.json`
 
 ## Natural-Language Queries Supported
 
-- `What files have been indexed?`
-- `What files mention wazuh?`
-- `What files mention wazuh in filename?`
-- `Find files mentioning docker in text`
+- `where did I mention wazuh?`
+- `find my note about backups`
+- `notes with docker in the title`
+- `what files have been indexed?`
+- `what is the difference between TCP and UDP?`
 
-## Answer Behavior
+## Query Behavior
 
-For normal Q&A, the assistant is instructed to use only provided sources.  
-If it cannot ground an answer in retrieved notes, fallback is:
-
-`I can't find that in your notes.`
+- Queries clearly about your files or prior notes are routed to natural-language note search.
+- Other prompts are routed to general chat using the configured chat model.
+- Note search returns ranked file and snippet matches instead of requiring `/find*` commands.
+- Reindex after upgrading so new heading/title metadata is stored and used in ranking.
 
 ## Troubleshooting
 
@@ -173,4 +256,9 @@ If it cannot ground an answer in retrieved notes, fallback is:
 ## Notes
 
 - First run may show no indexed files until background indexing runs or you execute `/reindex`.
-- Generic Q&A uses top-k retrieval and may not be exhaustive for file discovery; use `/find*` commands for that.
+- Use `/reindex-force` when you want to rebuild every indexed file, even if the files themselves did not change.
+- Use `/reindex-status` to check live progress while a long background or manual reindex is running.
+- Filename-focused searches are boosted directly from the indexed manifest so title/path queries do not depend entirely on semantic retrieval.
+- Use `python run_eval.py` after ranking changes so you can compare hit rates instead of tuning by feel.
+- Query embeddings are cached locally in `data/query_embedding_cache.sqlite`, so repeated searches and eval runs reuse prior embeddings instead of calling the API again for the same query text.
+- Natural-language note searches are logged locally in `data/search_queries.jsonl`, which you can convert into draft eval cases with `python run_eval_candidates.py`.

@@ -27,6 +27,12 @@ class Manifest:
                     size INTEGER NOT NULL
                 )
             """)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
             con.commit()
 
     def get(self, rel_path: str) -> FileState | None:
@@ -65,4 +71,24 @@ class Manifest:
             rows = con.execute("SELECT rel_path, mtime, size FROM files").fetchall()
         for r in rows:
             yield FileState(*r)
+
+    def get_meta(self, key: str) -> str | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if not row:
+            return None
+        return str(row[0])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._connect() as con:
+            con.execute("""
+                INSERT INTO meta(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value
+            """, (key, value))
+            con.commit()
             

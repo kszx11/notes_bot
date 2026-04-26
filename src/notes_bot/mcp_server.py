@@ -13,15 +13,20 @@ from typing import Any
 from openai import OpenAI
 
 from .config import load_config
+from .embedding_cache import QueryEmbeddingCache, get_query_embedding
+from .eval_candidates import build_eval_candidates, load_eval_candidates, promote_eval_candidates
+from .intent import route_user_input
 from .hybrid import hybrid_rerank
 from .indexer import run_index_once
 from .manifest import Manifest
-from .prompt import SYSTEM_PROMPT, allowed_citation_set, build_sources_block
+from .prompt import GENERAL_CHAT_PROMPT, SYSTEM_PROMPT, allowed_citation_set, build_sources_block
+from .search import search_notes
+from .search_log import append_search_log
 from .store import VectorStore
 from .validate import validate_structured_answer
 
 SERVER_NAME = "notes-bot-mcp"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.2.0"
 
 
 class MCPError(Exception):
@@ -34,6 +39,7 @@ class MCPError(Exception):
 class ReindexState:
     running: bool = False
     owner: str = ""
+    mode: str = "incremental"
     started_at: float | None = None
     ended_at: float | None = None
     current_file: str = ""
@@ -52,6 +58,10 @@ class NotesMCPServer:
         self.client = OpenAI()
         self.manifest = Manifest(self.cfg.manifest_path)
         self.store = VectorStore(self.cfg.index_dir, collection_name="notes")
+        self.query_embedding_cache = QueryEmbeddingCache(self.cfg.data_dir / "query_embedding_cache.sqlite")
+        self.search_log_path = self.cfg.data_dir / "search_queries.jsonl"
+        self.eval_candidates_path = self.cfg.data_dir / "eval_candidates.json"
+        self.eval_queries_path = self.cfg.data_dir / "eval_queries.json"
 
         self._index_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -110,10 +120,11 @@ class NotesMCPServer:
                     })
         return cb
 
-    def _run_index_pass(self, owner: str) -> dict[str, Any]:
+    def _run_index_pass(self, owner: str, force_reindex: bool = False) -> dict[str, Any]:
         self._set_state(
             running=True,
             owner=owner,
+            mode="full" if force_reindex else "incremental",
             started_at=time.time(),
             ended_at=None,
             status="starting",
@@ -131,11 +142,13 @@ class NotesMCPServer:
                 chunk_overlap=self.cfg.chunk_overlap,
                 max_file_size_mb=self.cfg.max_file_size_mb,
                 max_chunks_per_file=self.cfg.max_chunks_per_file,
+                force_reindex=force_reindex,
                 progress_callback=self._progress_callback(owner),
             )
             payload = {
                 "ok": True,
                 "owner": owner,
+                "mode": "full" if force_reindex else "incremental",
                 "stats": {
                     "scanned": stats.scanned,
                     "updated": stats.updated,
@@ -153,6 +166,7 @@ class NotesMCPServer:
             self._set_state(
                 running=False,
                 owner="",
+                mode="incremental",
                 ended_at=time.time(),
                 status="idle",
                 current_file="",
@@ -165,7 +179,7 @@ class NotesMCPServer:
         while not self._stop_event.is_set():
             if self._index_lock.acquire(timeout=1):
                 try:
-                    self._run_index_pass(owner="background")
+                    self._run_index_pass(owner="background", force_reindex=False)
                 finally:
                     self._index_lock.release()
 
@@ -175,8 +189,12 @@ class NotesMCPServer:
                 slept += 1
 
     def _embed_query(self, text: str) -> list[float]:
-        resp = self.client.embeddings.create(model=self.cfg.embedding_model, input=text)
-        return resp.data[0].embedding
+        return get_query_embedding(
+            client=self.client,
+            model=self.cfg.embedding_model,
+            text=text,
+            cache=self.query_embedding_cache,
+        )
 
     def _list_indexed_files(self) -> list[str]:
         return sorted(self.manifest.all_paths())
@@ -340,8 +358,166 @@ class NotesMCPServer:
             "model": self.cfg.chat_model,
         }
 
+    def _route_query(self, query: str) -> dict[str, Any]:
+        decision = route_user_input(query)
+        return {
+            "query": query,
+            "mode": decision.mode,
+            "confidence": decision.confidence,
+            "reasons": decision.reasons,
+            "command_name": decision.command_name,
+        }
+
+    def _query_notes(self, query: str, limit: int) -> dict[str, Any]:
+        results = search_notes(
+            query=query,
+            client=self.client,
+            cfg=self.cfg,
+            manifest=self.manifest,
+            store=self.store,
+            limit=limit,
+        )
+        try:
+            append_search_log(self.search_log_path, query=query, results=results)
+        except OSError:
+            pass
+        payload = []
+        for hit in results.hits:
+            payload.append(
+                {
+                    "rel_path": hit.rel_path,
+                    "start_line": hit.start_line,
+                    "end_line": hit.end_line,
+                    "snippet": hit.snippet,
+                    "heading": hit.heading,
+                    "first_line": hit.first_line,
+                    "score": hit.score,
+                    "reasons": hit.reasons,
+                    "filename_score": hit.filename_score,
+                    "text_score": hit.text_score,
+                    "semantic_score": hit.semantic_score,
+                    "keyword_score": hit.keyword_score,
+                    "metadata_score": hit.metadata_score,
+                    "chunk_index": hit.chunk_index,
+                }
+            )
+        return {
+            "query": query,
+            "query_type": results.query_type,
+            "count": len(payload),
+            "results": payload,
+        }
+
+    def _eval_candidates(self, limit: int, refresh: bool) -> dict[str, Any]:
+        if refresh:
+            candidates = build_eval_candidates(
+                log_path=self.search_log_path,
+                existing_eval_path=self.eval_queries_path,
+                limit=limit,
+            )
+            self.eval_candidates_path.parent.mkdir(parents=True, exist_ok=True)
+            self.eval_candidates_path.write_text(json.dumps(candidates, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        else:
+            candidates = load_eval_candidates(self.eval_candidates_path)
+            if limit > 0:
+                candidates = candidates[:limit]
+        return {
+            "count": len(candidates),
+            "results": candidates,
+            "candidate_path": str(self.eval_candidates_path),
+            "eval_path": str(self.eval_queries_path),
+        }
+
+    def _eval_promote(self, selections: list[int] | None, promote_all: bool) -> dict[str, Any]:
+        promoted, remaining = promote_eval_candidates(
+            candidate_path=self.eval_candidates_path,
+            eval_path=self.eval_queries_path,
+            selections=None if promote_all else selections,
+        )
+        return {
+            "promoted": promoted,
+            "remaining": remaining,
+            "candidate_path": str(self.eval_candidates_path),
+            "eval_path": str(self.eval_queries_path),
+        }
+
+    def _general_chat(self, query: str) -> dict[str, Any]:
+        resp = self.client.chat.completions.create(
+            model=self.cfg.chat_model,
+            messages=[
+                {"role": "system", "content": GENERAL_CHAT_PROMPT},
+                {"role": "user", "content": query},
+            ],
+            temperature=0.3,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+        return {
+            "query": query,
+            "answer": answer,
+            "model": self.cfg.chat_model,
+        }
+
     def _build_tools(self) -> dict[str, dict[str, Any]]:
         return {
+            "route_query": {
+                "description": "Classify a natural-language query as command, notes_search, or general_chat.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+            "query_notes": {
+                "description": "Search indexed notes and return ranked file and snippet matches.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+            "eval_candidates": {
+                "description": "Build or read draft eval cases from logged natural-language note searches.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 25},
+                        "refresh": {"type": "boolean", "default": True},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "eval_promote": {
+                "description": "Promote reviewed eval candidates into the main eval set.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "selections": {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 1},
+                        },
+                        "promote_all": {"type": "boolean", "default": False},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "chat": {
+                "description": "Handle a general world-knowledge prompt without retrieving notes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
             "list_indexed_files": {
                 "description": "List indexed files from the manifest.",
                 "inputSchema": {
@@ -354,7 +530,7 @@ class NotesMCPServer:
                 },
             },
             "find_files": {
-                "description": "Find indexed files by term in filename and/or text.",
+                "description": "Legacy compatibility tool. Find indexed files by term in filename and/or text.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -367,7 +543,7 @@ class NotesMCPServer:
                 },
             },
             "search_notes": {
-                "description": "Vector + hybrid keyword retrieval against indexed note chunks.",
+                "description": "Legacy compatibility tool. Low-level vector + hybrid keyword retrieval against indexed note chunks.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -399,18 +575,19 @@ class NotesMCPServer:
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             "reindex_now": {
-                "description": "Run incremental reindex immediately. Starts async when idle by default; use wait=true to block until finished.",
+                "description": "Run reindex immediately. Incremental by default; pass force_reindex=true to rebuild everything.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "wait": {"type": "boolean", "default": False},
+                        "force_reindex": {"type": "boolean", "default": False},
                         "lock_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 300},
                     },
                     "additionalProperties": False,
                 },
             },
             "answer_from_notes": {
-                "description": "Generate grounded answer from indexed notes using citations.",
+                "description": "Legacy compatibility tool. Generate grounded answer from indexed notes using citations.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -528,7 +705,7 @@ class NotesMCPServer:
             top_k = int(args.get("top_k", self.cfg.top_k))
             prompt_text = (
                 "Use the notes MCP server tools to answer this question using only indexed notes.\n"
-                "1) Call search_notes with the question and top_k.\n"
+                "1) Call query_notes with the question and a reasonable limit.\n"
                 "2) If evidence is insufficient, call get_note for cited files/lines.\n"
                 "3) Respond with grounded citations and no outside knowledge.\n\n"
                 f"Question: {q}\n"
@@ -545,6 +722,43 @@ class NotesMCPServer:
 
     def tool_call(self, name: str, args: dict[str, Any] | None) -> dict[str, Any]:
         a = args or {}
+
+        if name == "route_query":
+            query = str(a.get("query", "")).strip()
+            if not query:
+                raise MCPError("query is required", code=-32602)
+            return _tool_ok(self._route_query(query))
+
+        if name == "query_notes":
+            query = str(a.get("query", "")).strip()
+            if not query:
+                raise MCPError("query is required", code=-32602)
+            limit = max(1, min(30, int(a.get("limit", 8))))
+            return _tool_ok(self._query_notes(query, limit))
+
+        if name == "eval_candidates":
+            limit = max(1, min(200, int(a.get("limit", 25))))
+            refresh = bool(a.get("refresh", True))
+            return _tool_ok(self._eval_candidates(limit, refresh))
+
+        if name == "eval_promote":
+            promote_all = bool(a.get("promote_all", False))
+            raw_selections = a.get("selections", [])
+            selections: list[int] | None = None
+            if not promote_all:
+                if raw_selections is None:
+                    selections = []
+                elif not isinstance(raw_selections, list):
+                    raise MCPError("selections must be an array of 1-based candidate indexes", code=-32602)
+                else:
+                    selections = [max(1, int(item)) for item in raw_selections]
+            return _tool_ok(self._eval_promote(selections, promote_all))
+
+        if name == "chat":
+            query = str(a.get("query", "")).strip()
+            if not query:
+                raise MCPError("query is required", code=-32602)
+            return _tool_ok(self._general_chat(query))
 
         if name == "list_indexed_files":
             limit = max(1, min(500, int(a.get("limit", 200))))
@@ -599,6 +813,7 @@ class NotesMCPServer:
 
         if name == "reindex_now":
             wait = bool(a.get("wait", False))
+            force_reindex = bool(a.get("force_reindex", False))
             timeout = max(1, min(86400, int(a.get("lock_timeout_seconds", 300))))
 
             if wait:
@@ -613,7 +828,7 @@ class NotesMCPServer:
                         }
                     )
                 try:
-                    payload = self._run_index_pass(owner="manual")
+                    payload = self._run_index_pass(owner="manual", force_reindex=force_reindex)
                     payload["started"] = True
                     payload["wait"] = True
                     return _tool_ok(payload)
@@ -633,12 +848,17 @@ class NotesMCPServer:
             def _run_async() -> None:
                 if self._index_lock.acquire(blocking=False):
                     try:
-                        self._run_index_pass(owner="manual_async")
+                        self._run_index_pass(owner="manual_async", force_reindex=force_reindex)
                     finally:
                         self._index_lock.release()
 
             threading.Thread(target=_run_async, daemon=True).start()
-            return _tool_ok({"ok": True, "started": True, "wait": False})
+            return _tool_ok({
+                "ok": True,
+                "started": True,
+                "wait": False,
+                "mode": "full" if force_reindex else "incremental",
+            })
 
         if name == "answer_from_notes":
             question = str(a.get("question", "")).strip()

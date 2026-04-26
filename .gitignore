@@ -194,6 +194,15 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# notes_bot local runtime state
+.codex/
+data/chat_history.jsonl
+data/chroma/
+data/manifest.sqlite
+data/query_embedding_cache.sqlite
+data/search_queries.jsonl
+data/eval_candidates.json
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
