@@ -366,6 +366,8 @@ class NotesMCPServer:
             "confidence": decision.confidence,
             "reasons": decision.reasons,
             "command_name": decision.command_name,
+            "note_path_hint": decision.note_path_hint,
+            "note_result_index": decision.note_result_index,
         }
 
     def _query_notes(self, query: str, limit: int) -> dict[str, Any]:
@@ -460,7 +462,7 @@ class NotesMCPServer:
     def _build_tools(self) -> dict[str, dict[str, Any]]:
         return {
             "route_query": {
-                "description": "Classify a natural-language query as command, notes_search, or general_chat.",
+                "description": "Classify a natural-language query as command, note_open, notes_search, or general_chat.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

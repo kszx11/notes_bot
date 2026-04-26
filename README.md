@@ -13,6 +13,7 @@ A local notes RAG assistant that:
 - Natural-language routing between note search and general chat
 - Chat history persistence
 - Ranked search results with file paths and snippets
+- Direct note opening by filename or prior search-result number
 - Chunk metadata includes file/title context to improve vague searches after reindexing
 
 ## Project Layout
@@ -228,6 +229,8 @@ Candidate generation workflow:
 
 - `where did I mention wazuh?`
 - `find my note about backups`
+- `show me the contents of Twingate.md`
+- `show me the first one`
 - `notes with docker in the title`
 - `what files have been indexed?`
 - `what is the difference between TCP and UDP?`
@@ -235,6 +238,8 @@ Candidate generation workflow:
 ## Query Behavior
 
 - Queries clearly about your files or prior notes are routed to natural-language note search.
+- Explicit filename requests such as `show me the contents of Twingate.md` open the indexed note directly.
+- Follow-up requests such as `show me the first one` open the corresponding item from the most recent search result list.
 - Other prompts are routed to general chat using the configured chat model.
 - Note search returns ranked file and snippet matches instead of requiring `/find*` commands.
 - Reindex after upgrading so new heading/title metadata is stored and used in ranking.

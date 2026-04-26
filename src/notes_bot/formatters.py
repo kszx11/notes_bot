@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from .search import SearchResults
 
 
@@ -20,4 +22,9 @@ def format_search_results(results: SearchResults) -> str:
             lines.append(f"   heading: {hit.heading}")
         if hit.snippet:
             lines.append(f"   snippet: {hit.snippet}")
+    first_name = Path(results.hits[0].rel_path).name
+    lines.append("")
+    lines.append(
+        f"Open a result by saying: show me the contents of {first_name} or show me the first one"
+    )
     return "\n".join(lines)

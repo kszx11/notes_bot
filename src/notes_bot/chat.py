@@ -24,6 +24,8 @@ HELP_TEXT = (
     "- where did I mention docker auth?\n"
     "- find my note about backups\n"
     "- notes with incident in the title\n"
+    "- show me the contents of Twingate.md\n"
+    "- show me the first one\n"
     "- what is the difference between TCP and UDP?\n"
     "\n"
     "Commands:\n"
@@ -760,6 +762,92 @@ def _handle_meta_query(user_text: str, cfg, manifest: Manifest) -> str | None:
     return None
 
 
+def _safe_doc_path(cfg, rel_path: str) -> Path:
+    root = cfg.doc_root.resolve()
+    candidate = (root / rel_path).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("Invalid rel_path outside doc_root")
+    return candidate
+
+
+def _resolve_note_matches(rel_path_hint: str, manifest: Manifest) -> list[str]:
+    hint = rel_path_hint.strip().replace("\\", "/").lstrip("./")
+    if not hint:
+        return []
+
+    hint_low = hint.lower()
+    all_paths = sorted(manifest.all_paths())
+
+    exact_rel = [rel_path for rel_path in all_paths if rel_path.lower() == hint_low]
+    if exact_rel:
+        return exact_rel
+
+    basename = Path(hint).name.lower()
+    exact_basename = [rel_path for rel_path in all_paths if Path(rel_path).name.lower() == basename]
+    if exact_basename:
+        return exact_basename
+
+    suffix_matches = [
+        rel_path
+        for rel_path in all_paths
+        if rel_path.lower() == hint_low or rel_path.lower().endswith("/" + hint_low)
+    ]
+    return suffix_matches
+
+
+def _format_note_contents(rel_path: str, text: str, *, truncated: bool, max_chars: int) -> str:
+    body = text.rstrip("\n")
+    if not body:
+        body = "(file is empty)"
+    if truncated:
+        body += f"\n\n[truncated to first {max_chars} characters]"
+    return f"Contents of {rel_path}:\n\n{body}"
+
+
+def _open_note_from_request(user_text: str, decision, cfg, manifest: Manifest, last_search_hits: list[str]) -> str:
+    max_chars = max(200, int(cfg.max_sources_chars))
+    rel_path: str | None = None
+
+    if decision.note_result_index is not None:
+        if not last_search_hits:
+            return "I do not have a recent search result list to open from yet. Search first or name the file directly."
+        idx = decision.note_result_index
+        if idx < 1 or idx > len(last_search_hits):
+            return f"The last search returned {len(last_search_hits)} result(s), so I cannot open #{idx}."
+        rel_path = last_search_hits[idx - 1]
+    elif decision.note_path_hint:
+        matches = _resolve_note_matches(decision.note_path_hint, manifest)
+        if not matches:
+            return f"No indexed file matched {decision.note_path_hint}."
+        if len(matches) > 1:
+            options = "\n".join(f"- {match}" for match in matches[:10])
+            more = ""
+            if len(matches) > 10:
+                more = f"\n... ({len(matches) - 10} more)"
+            return (
+                f"Multiple indexed files matched {decision.note_path_hint}:\n"
+                f"{options}{more}\n"
+                "Say the full relative path you want to open."
+            )
+        rel_path = matches[0]
+
+    if rel_path is None:
+        return f"I could not determine which note to open from: {user_text}"
+
+    try:
+        abs_path = _safe_doc_path(cfg, rel_path)
+    except ValueError:
+        return f"I could not open {rel_path} because the resolved path is outside the notes directory."
+
+    if not abs_path.exists() or not abs_path.is_file():
+        return f"The indexed file {rel_path} is no longer available on disk. Reindex and try again."
+
+    text = _read_note_text(abs_path)
+    truncated = len(text) > max_chars
+    excerpt = text[:max_chars]
+    return _format_note_contents(rel_path, excerpt, truncated=truncated, max_chars=max_chars)
+
+
 def _run_general_chat(user_text: str, turns: list[ChatTurn], client: OpenAI, cfg) -> str:
     messages = [{"role": "system", "content": GENERAL_CHAT_PROMPT}]
     for tr in turns:
@@ -851,6 +939,7 @@ def main(config_path: str | Path = "config.yaml"):
     history_store = ChatHistory(cfg.chat_history_path)
     turns = history_store.load()
     search_log_path = cfg.data_dir / "search_queries.jsonl"
+    last_search_hits: list[str] = []
 
     stop_event = threading.Event()
     index_lock = threading.Lock()
@@ -895,6 +984,7 @@ def main(config_path: str | Path = "config.yaml"):
                 if decision.command_name == "clear":
                     turns.clear()
                     history_store.clear()
+                    last_search_hits.clear()
                     print("Cleared chat context.\n")
                     continue
 
@@ -1016,7 +1106,9 @@ def main(config_path: str | Path = "config.yaml"):
                 history_store.append("assistant", meta_answer)
                 continue
 
-            if decision.mode == "notes_search":
+            if decision.mode == "note_open":
+                answer = _open_note_from_request(user, decision, cfg, manifest, last_search_hits)
+            elif decision.mode == "notes_search":
                 results = search_notes(
                     query=user,
                     client=client,
@@ -1029,6 +1121,7 @@ def main(config_path: str | Path = "config.yaml"):
                     append_search_log(search_log_path, query=user, results=results)
                 except OSError:
                     pass
+                last_search_hits = [hit.rel_path for hit in results.hits]
                 answer = format_search_results(results)
             else:
                 answer = _run_general_chat(user, recent_turns(), client, cfg)
