@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -15,8 +16,13 @@ class Manifest:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
+    @contextmanager
     def _connect(self):
-        return sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path)
+        try:
+            yield con
+        finally:
+            con.close()
 
     def _init(self):
         with self._connect() as con:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 from openai import OpenAI
@@ -14,8 +15,13 @@ class QueryEmbeddingCache:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
+    @contextmanager
     def _connect(self):
-        return sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path)
+        try:
+            yield con
+        finally:
+            con.close()
 
     def _init(self) -> None:
         with self._connect() as con:
