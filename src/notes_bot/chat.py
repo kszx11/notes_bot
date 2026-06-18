@@ -1,5 +1,4 @@
 from __future__ import annotations
-from dataclasses import dataclass
 import re
 import threading
 import time
@@ -8,36 +7,43 @@ from pathlib import Path
 from openai import OpenAI
 
 from .config import load_config
-from .eval_candidates import build_eval_candidates, load_eval_candidates, parse_candidate_selections, promote_eval_candidates, write_eval_candidate_file
-from .formatters import format_search_results
-from .intent import route_user_input
 from .manifest import Manifest
 from .store import VectorStore
 from .indexer import run_index_once
 from .history import ChatHistory, ChatTurn
-from .prompt import GENERAL_CHAT_PROMPT
-from .search import search_notes
-from .search_log import append_search_log
+from .runtime import validate_runtime_config
+from .retrieval import RetrievalService, format_passage_results
+from .note_view import get_note_excerpt, safe_doc_path
+from .intent import detect_query_intent
+from .doc_roots import split_virtual_rel_path
+
+UNSUPPORTED_ANSWER = "I can't find that in your notes."
 
 HELP_TEXT = (
-    "Ask naturally:\n"
-    "- where did I mention docker auth?\n"
-    "- find my note about backups\n"
-    "- notes with incident in the title\n"
-    "- show me the contents of Twingate.md\n"
-    "- show me the first one\n"
-    "- what is the difference between TCP and UDP?\n"
-    "\n"
     "Commands:\n"
     "- /help show this help\n"
     "- /clear clear chat context/history\n"
     "- /reindex run incremental indexing now\n"
-    "- /reindex-force rebuild the entire index now\n"
-    "- /reindex-status show current indexer status\n"
-    "- /eval-candidates refresh and show draft eval cases from search logs\n"
-    "- /eval-promote <n|a-b|all> move reviewed eval candidates into the main eval set\n"
     "- /indexed list indexed files from manifest\n"
+    "- /roots show indexed file counts by configured doc root\n"
+    "- /status show manifest status summary and recent non-indexed files\n"
+    "- /find <term> search indexed files by filename or text\n"
+    "- /findfresh <term> search indexed files but exclude stale entries\n"
+    "- /findname <term> search filename only\n"
+    "- /findtext <term> search text content only\n"
+    "- /search <term> search note passages and show excerpts\n"
+    "- /searchfresh <term> search passages from fresh indexed content only\n"
+    "- /open <n> open surrounding context for a result from the last /search\n"
+    "- /open <path[:start-end]> open a note or line range with context\n"
     "- /exit quit\n"
+    "\n"
+    "Scope prompts/results to a configured doc root with a leading @rootname.\n"
+    "- example: @personal1 what does this say about prayer?\n"
+    "- example: @personal2 /search authentication failure\n"
+    "\n"
+    "Auto routing:\n"
+    "- short keyword-style queries default to passage search\n"
+    "- question-style queries default to grounded answering\n"
 )
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -59,23 +65,6 @@ _API_KEY_RE_LIST = [
 ]
 
 
-@dataclass
-class ReindexStatus:
-    running: bool = False
-    owner: str = ""
-    mode: str = "incremental"
-    phase: str = "idle"
-    status: str = "idle"
-    current_file: str = ""
-    current_index: int = 0
-    total_files: int = 0
-    updated: int = 0
-    deleted: int = 0
-    errors: int = 0
-    started_at: float = 0.0
-    updated_at: float = 0.0
-
-
 def _read_note_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -91,113 +80,21 @@ def _fmt_seconds(total_seconds: float) -> str:
     return f"{m:02d}:{sec:02d}"
 
 
-def _set_reindex_status(state: ReindexStatus, state_lock: threading.Lock, **kwargs) -> None:
-    with state_lock:
-        for key, value in kwargs.items():
-            setattr(state, key, value)
-        state.updated_at = time.time()
-
-
-def _get_reindex_status(state: ReindexStatus, state_lock: threading.Lock) -> ReindexStatus:
-    with state_lock:
-        return ReindexStatus(**state.__dict__)
-
-
-def _format_reindex_status(state: ReindexStatus) -> str:
-    if state.running:
-        runtime = _fmt_seconds(max(0.0, time.time() - state.started_at)) if state.started_at else "--:--"
-        progress = f"{state.current_index}/{state.total_files}" if state.total_files > 0 else "--/--"
-        location = state.current_file or "<starting>"
-        return (
-            f"Indexer is running.\n"
-            f"- owner: {state.owner or 'unknown'}\n"
-            f"- mode: {state.mode}\n"
-            f"- phase: {state.phase}\n"
-            f"- status: {state.status}\n"
-            f"- progress: {progress}\n"
-            f"- elapsed: {runtime}\n"
-            f"- updated: {state.updated}\n"
-            f"- deleted: {state.deleted}\n"
-            f"- errors: {state.errors}\n"
-            f"- file: {location}"
-        )
-
-    if state.updated_at > 0:
-        age = _fmt_seconds(max(0.0, time.time() - state.updated_at))
-        return (
-            f"Indexer is idle.\n"
-            f"- last owner: {state.owner or 'n/a'}\n"
-            f"- last mode: {state.mode}\n"
-            f"- last phase: {state.phase}\n"
-            f"- last status: {state.status}\n"
-            f"- updated: {state.updated}\n"
-            f"- deleted: {state.deleted}\n"
-            f"- errors: {state.errors}\n"
-            f"- last update: {age} ago"
-        )
-
-    return "Indexer is idle. No reindex activity recorded in this session."
-
-
-def _make_progress_callback(label: str, state: ReindexStatus | None = None, state_lock: threading.Lock | None = None):
+def _make_progress_callback(label: str):
     start = time.time()
     bar_width = 28
     last_emit = 0.0
-    last_file_emit = 0.0
 
     def on_progress(event: dict) -> None:
-        nonlocal last_emit, last_file_emit
+        nonlocal last_emit
         phase = event.get("phase")
         stats = event.get("stats")
-
-        if phase == "schema_upgrade":
-            reason = str(event.get("reason", "schema_upgrade"))
-            old_version = str(event.get("old_version", "unset"))
-            new_version = str(event.get("new_version", "unset"))
-            total_files = int(event.get("total_files", 0))
-            if state is not None and state_lock is not None:
-                _set_reindex_status(
-                    state,
-                    state_lock,
-                    running=True,
-                    phase="schema_upgrade",
-                    status=reason,
-                    total_files=total_files,
-                )
-            if reason == "manual_force":
-                print(f"[{label}] starting full reindex of {total_files} file(s).", flush=True)
-            else:
-                print(
-                    f"[{label}] index schema changed {old_version} -> {new_version}; "
-                    f"forcing full reindex of {total_files} file(s).",
-                    flush=True,
-                )
-            return
 
         if phase == "scan":
             idx = int(event.get("index", 0))
             total = max(1, int(event.get("total", 1)))
             status = str(event.get("status", ""))
-            mode = str(event.get("mode", "incremental"))
             rel_path = str(event.get("rel_path", ""))
-            if state is not None and state_lock is not None:
-                updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-                deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-                errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-                _set_reindex_status(
-                    state,
-                    state_lock,
-                    running=True,
-                    mode=mode,
-                    phase="scan",
-                    status=status,
-                    current_file=rel_path,
-                    current_index=idx,
-                    total_files=total,
-                    updated=updated,
-                    deleted=deleted,
-                    errors=errors,
-                )
 
             elapsed = max(0.001, time.time() - start)
             rate = idx / elapsed
@@ -207,7 +104,7 @@ def _make_progress_callback(label: str, state: ReindexStatus | None = None, stat
             bar = "#" * filled + "-" * (bar_width - filled)
 
             prefix = (
-                f"[{label}] mode={mode:<11} [{bar}] {idx}/{total} {pct*100:5.1f}% "
+                f"[{label}] [{bar}] {idx}/{total} {pct*100:5.1f}% "
                 f"status={status:<9} eta={_fmt_seconds(eta)}"
             )
             if stats is not None:
@@ -241,104 +138,13 @@ def _make_progress_callback(label: str, state: ReindexStatus | None = None, stat
             idx = int(event.get("index", 0))
             total = max(1, int(event.get("total", 1)))
             rel_path = str(event.get("rel_path", ""))
-            if state is not None and state_lock is not None:
-                updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-                deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-                errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-                _set_reindex_status(
-                    state,
-                    state_lock,
-                    running=True,
-                    phase="delete",
-                    status="deleting",
-                    current_file=rel_path,
-                    current_index=idx,
-                    total_files=total,
-                    updated=updated,
-                    deleted=deleted,
-                    errors=errors,
-                )
             pct = idx / total
             filled = int(bar_width * pct)
             bar = "#" * filled + "-" * (bar_width - filled)
             print(f"[{label}] deleting [{bar}] {idx}/{total} {pct*100:5.1f}% file={rel_path[:80]}", flush=True)
 
-        elif phase == "file":
-            idx = int(event.get("index", 0))
-            total = max(1, int(event.get("total", 1)))
-            status = str(event.get("status", ""))
-            rel_path = str(event.get("rel_path", ""))
-            stats_suffix = ""
-            if stats is not None:
-                stats_suffix = f" u={stats.updated} d={stats.deleted} e={stats.errors}"
-            if state is not None and state_lock is not None:
-                updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-                deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-                errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-                _set_reindex_status(
-                    state,
-                    state_lock,
-                    running=True,
-                    phase="file",
-                    status=status,
-                    current_file=rel_path,
-                    current_index=idx,
-                    total_files=total,
-                    updated=updated,
-                    deleted=deleted,
-                    errors=errors,
-                )
-
-            line = None
-            if status == "read_start":
-                line = f"[{label}] file {idx}/{total} reading {rel_path[:80]}{stats_suffix}"
-            elif status == "read_done":
-                chars = int(event.get("chars", 0))
-                line = f"[{label}] file {idx}/{total} read_done chars={chars} file={rel_path[:80]}{stats_suffix}"
-            elif status == "chunk_start":
-                line = f"[{label}] file {idx}/{total} chunking {rel_path[:80]}{stats_suffix}"
-            elif status == "chunk_done":
-                chunks = int(event.get("chunks", 0))
-                line = f"[{label}] file {idx}/{total} chunk_done chunks={chunks} file={rel_path[:80]}{stats_suffix}"
-            elif status == "delete_start":
-                line = f"[{label}] file {idx}/{total} replacing old chunks for {rel_path[:80]}{stats_suffix}"
-            elif status == "chunked":
-                chunks = int(event.get("chunks", 0))
-                batches = int(event.get("batches", 0))
-                line = (
-                    f"[{label}] file {idx}/{total} ready_to_embed chunks={chunks} "
-                    f"batches={batches} file={rel_path[:80]}{stats_suffix}"
-                )
-            elif status == "embedding_batch":
-                batch = int(event.get("batch", 0))
-                batches = int(event.get("batches", 0))
-                batch_size = int(event.get("batch_size", 0))
-                line = (
-                    f"[{label}] file {idx}/{total} embedding batch {batch}/{batches} "
-                    f"size={batch_size} file={rel_path[:80]}{stats_suffix}"
-                )
-
-            now = time.time()
-            if line and (status == "embedding_batch" or (now - last_file_emit) >= 0.5):
-                print(line, flush=True)
-                last_file_emit = now
-
         elif phase == "done":
             elapsed = time.time() - start
-            if state is not None and state_lock is not None:
-                updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-                deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-                errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-                _set_reindex_status(
-                    state,
-                    state_lock,
-                    running=False,
-                    phase="done",
-                    status="done",
-                    updated=updated,
-                    deleted=deleted,
-                    errors=errors,
-                )
             if stats is not None:
                 print(
                     f"[{label}] complete in {_fmt_seconds(elapsed)}. "
@@ -351,157 +157,20 @@ def _make_progress_callback(label: str, state: ReindexStatus | None = None, stat
     return on_progress
 
 
-def _make_background_progress_callback(label: str, state: ReindexStatus, state_lock: threading.Lock):
-    last_scan_emit = 0.0
-    last_file_emit = 0.0
-    saw_notable_event = False
-
+def _make_background_progress_callback(label: str):
     def on_progress(event: dict) -> None:
-        nonlocal last_scan_emit, last_file_emit, saw_notable_event
         phase = event.get("phase")
-        stats = event.get("stats")
-
-        if phase == "schema_upgrade":
-            reason = str(event.get("reason", "schema_upgrade"))
-            old_version = str(event.get("old_version", "unset"))
-            new_version = str(event.get("new_version", "unset"))
-            total_files = int(event.get("total_files", 0))
-            _set_reindex_status(
-                state,
-                state_lock,
-                running=True,
-                owner="background",
-                mode="incremental",
-                phase="schema_upgrade",
-                status=reason,
-                total_files=total_files,
-            )
-            if reason == "manual_force":
-                print(f"\n[{label}] starting full reindex of {total_files} file(s).\n", flush=True)
-            else:
-                print(
-                    f"\n[{label}] index schema changed {old_version} -> {new_version}; "
-                    f"forcing full reindex of {total_files} file(s).\n",
-                    flush=True,
-                )
-            return
 
         if phase == "scan":
-            idx = int(event.get("index", 0))
-            total = max(1, int(event.get("total", 1)))
             status = str(event.get("status", ""))
-            mode = str(event.get("mode", "incremental"))
             rel_path = str(event.get("rel_path", ""))
-            updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-            deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-            errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-            _set_reindex_status(
-                state,
-                state_lock,
-                running=True,
-                owner="background",
-                mode=mode,
-                phase="scan",
-                status=status,
-                current_file=rel_path,
-                current_index=idx,
-                total_files=total,
-                updated=updated,
-                deleted=deleted,
-                errors=errors,
-            )
 
             if status == "error":
-                saw_notable_event = True
                 err = str(event.get("error", "unknown error"))
                 print(f"\n[{label}] file error: {rel_path} -> {err}\n")
                 return
 
-            notable_statuses = {"updating", "updated", "skipped_large", "reindex_all"}
-            if status not in notable_statuses:
-                return
-
-            saw_notable_event = True
-            now = time.time()
-            if status in ("updated", "skipped_large", "error") or (now - last_scan_emit) >= 2.0:
-                print(
-                    f"[{label}] mode={mode:<11} {idx}/{total} status={status:<12} "
-                    f"u={updated} d={deleted} e={errors} file={rel_path[:80]}",
-                    flush=True,
-                )
-                last_scan_emit = now
-            return
-
-        if phase == "file":
-            idx = int(event.get("index", 0))
-            total = max(1, int(event.get("total", 1)))
-            status = str(event.get("status", ""))
-            rel_path = str(event.get("rel_path", ""))
-            updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-            deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-            errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-            _set_reindex_status(
-                state,
-                state_lock,
-                running=True,
-                owner="background",
-                phase="file",
-                status=status,
-                current_file=rel_path,
-                current_index=idx,
-                total_files=total,
-                updated=updated,
-                deleted=deleted,
-                errors=errors,
-            )
-            now = time.time()
-            if status == "embedding_batch":
-                saw_notable_event = True
-                batch = int(event.get("batch", 0))
-                batches = int(event.get("batches", 0))
-                print(
-                    f"[{label}] file {idx}/{total} embedding batch {batch}/{batches} file={rel_path[:80]}",
-                    flush=True,
-                )
-                last_file_emit = now
-            elif (now - last_file_emit) >= 2.0 and status in ("read_start", "chunk_start", "chunk_done", "chunked"):
-                saw_notable_event = True
-                print(f"[{label}] file {idx}/{total} status={status} file={rel_path[:80]}", flush=True)
-                last_file_emit = now
-            return
-
-        if phase == "done":
-            updated = int(getattr(stats, "updated", 0)) if stats is not None else state.updated
-            deleted = int(getattr(stats, "deleted", 0)) if stats is not None else state.deleted
-            errors = int(getattr(stats, "errors", 0)) if stats is not None else state.errors
-            _set_reindex_status(
-                state,
-                state_lock,
-                running=False,
-                owner="",
-                phase="done",
-                status="done",
-                updated=updated,
-                deleted=deleted,
-                errors=errors,
-                current_file="",
-                current_index=0,
-                total_files=0,
-            )
-            if saw_notable_event or updated > 0 or deleted > 0 or errors > 0:
-                total_files = int(event.get("total_files", 0))
-                print(
-                    f"[{label}] complete scanned={total_files} updated={updated} "
-                    f"deleted={deleted} errors={errors}",
-                    flush=True,
-                )
-
     return on_progress
-
-
-def _embed_query(client: OpenAI, model: str, text: str) -> list[float]:
-    resp = client.embeddings.create(model=model, input=text)
-    return resp.data[0].embedding
 
 
 def _list_indexed_files(manifest: Manifest) -> list[str]:
@@ -519,80 +188,241 @@ def _format_indexed_files(files: list[str], max_items: int = 100) -> str:
     return "\n".join(lines)
 
 
-def _format_eval_candidates(candidates: list[dict], max_items: int = 20) -> str:
-    if not candidates:
-        return (
-            "No eval candidates yet.\n"
-            "- Restart the bot so search logging is active.\n"
-            "- Use natural-language note searches for a while.\n"
-            "- Run /eval-candidates again."
-        )
+def _format_manifest_status(manifest: Manifest, max_items: int = 20) -> str:
+    counts = manifest.counts_by_status()
+    if not counts:
+        return "No files are tracked in the manifest yet."
 
-    shown = candidates[:max_items]
-    lines = [f"Eval candidates: {len(candidates)}"]
-    for idx, item in enumerate(shown, start=1):
-        query = str(item.get("query", "")).strip()
-        expected_paths = item.get("expected_paths", [])
-        top_path = expected_paths[0] if isinstance(expected_paths, list) and expected_paths else "<unknown>"
-        query_type = str(item.get("expected_query_type", "mixed"))
-        lines.append(f"{idx}. {query}")
-        lines.append(f"   top_path: {top_path}")
-        lines.append(f"   query_type: {query_type}")
-        top_snippet = str(item.get("top_observed_snippet", "")).strip()
-        if top_snippet:
-            lines.append(f"   observed: {top_snippet}")
-    if len(candidates) > max_items:
-        lines.append(f"... ({len(candidates) - max_items} more)")
-    lines.append("Use /eval-promote 1 2 5-8 or /eval-promote all after review.")
+    order = ["indexed", "stale", "skipped_large", "error"]
+    summary = ", ".join(f"{status}={counts.get(status, 0)}" for status in order if status in counts)
+    lines = [f"Manifest status: {summary}"]
+
+    non_indexed = [
+        st for st in sorted(manifest.iter_all(), key=lambda x: (x.status, x.rel_path))
+        if st.status != "indexed"
+    ]
+    for st in non_indexed[:max_items]:
+        detail = f"- {st.rel_path} [{st.status}]"
+        if st.chunk_count:
+            detail += f" chunks={st.chunk_count}"
+        if st.last_success_at:
+            age_seconds = max(0, int(time.time() - st.last_success_at))
+            detail += f" last_success={_fmt_seconds(age_seconds)} ago"
+        if st.last_error:
+            detail += f" -> {st.last_error}"
+        lines.append(detail)
+    if len(non_indexed) > max_items:
+        lines.append(f"... ({len(non_indexed) - max_items} more)")
     return "\n".join(lines)
 
 
-def _eval_file_paths(cfg) -> tuple[Path, Path]:
-    return cfg.data_dir / "search_queries.jsonl", cfg.data_dir / "eval_candidates.json"
+def _format_root_counts(cfg, manifest: Manifest) -> str:
+    root_names = [root.name for root in cfg.doc_roots]
+    counts: dict[str, dict[str, int]] = {
+        root_name: {"total": 0, "indexed": 0, "stale": 0, "skipped_large": 0, "error": 0}
+        for root_name in root_names
+    }
+    unknown = {"total": 0, "indexed": 0, "stale": 0, "skipped_large": 0, "error": 0}
+
+    for st in manifest.iter_all():
+        try:
+            root, _ = split_virtual_rel_path(cfg.doc_roots, st.rel_path)
+            bucket = counts.setdefault(
+                root.name,
+                {"total": 0, "indexed": 0, "stale": 0, "skipped_large": 0, "error": 0},
+            )
+        except ValueError:
+            bucket = unknown
+        bucket["total"] += 1
+        bucket[st.status] = bucket.get(st.status, 0) + 1
+
+    lines = ["Doc roots:"]
+    for root_name in root_names:
+        bucket = counts[root_name]
+        lines.append(
+            f"- {root_name}: total={bucket['total']} indexed={bucket['indexed']} "
+            f"stale={bucket['stale']} skipped_large={bucket['skipped_large']} error={bucket['error']}"
+        )
+    if unknown["total"]:
+        lines.append(
+            f"- unknown: total={unknown['total']} indexed={unknown['indexed']} "
+            f"stale={unknown['stale']} skipped_large={unknown['skipped_large']} error={unknown['error']}"
+        )
+    return "\n".join(lines)
 
 
-def _refresh_eval_candidates(cfg) -> list[dict]:
-    search_log_path, candidate_path = _eval_file_paths(cfg)
-    candidates = build_eval_candidates(
-        log_path=search_log_path,
-        existing_eval_path=cfg.data_dir / "eval_queries.json",
-        limit=50,
-    )
-    write_eval_candidate_file(candidate_path, candidates)
-    return candidates
+def _format_single_root_count(cfg, manifest: Manifest, root_name: str) -> str | None:
+    target = root_name.strip().lower()
+    root_names = {root.name for root in cfg.doc_roots}
+    if target not in root_names:
+        return None
 
+    bucket = {"total": 0, "indexed": 0, "stale": 0, "skipped_large": 0, "error": 0}
+    prefix = f"{target}/"
+    for st in manifest.iter_all():
+        rel_path = st.rel_path.replace("\\", "/")
+        if len(cfg.doc_roots) == 1:
+            matches = target == cfg.doc_roots[0].name
+        else:
+            matches = rel_path.startswith(prefix)
+        if not matches:
+            continue
+        bucket["total"] += 1
+        bucket[st.status] = bucket.get(st.status, 0) + 1
 
-def _promote_eval_candidates_from_text(user_text: str, cfg) -> str:
-    _, candidate_path = _eval_file_paths(cfg)
-    eval_path = cfg.data_dir / "eval_queries.json"
-    candidates = load_eval_candidates(candidate_path)
-    if not candidates:
-        return "No eval candidates are available to promote."
-
-    normalized = user_text.strip()
-    if normalized.lower().startswith("/eval-promote"):
-        suffix = normalized[len("/eval-promote"):].strip()
-    elif normalized.lower().startswith("promote eval candidates"):
-        suffix = normalized[len("promote eval candidates"):].strip()
-    else:
-        suffix = ""
-    args = suffix.split() if suffix else []
-    try:
-        selections = parse_candidate_selections(args, len(candidates))
-    except ValueError:
-        return "Could not parse candidate selection. Use /eval-promote 1 2 5-8 or /eval-promote all."
-
-    promoted, remaining = promote_eval_candidates(
-        candidate_path=candidate_path,
-        eval_path=eval_path,
-        selections=selections,
-    )
-    if promoted == 0:
-        return "No candidates were promoted."
     return (
-        f"Promoted {promoted} eval candidate(s) into {eval_path.name}.\n"
-        f"Remaining candidates: {remaining}"
+        f"Doc root {target}: total={bucket['total']} indexed={bucket['indexed']} "
+        f"stale={bucket['stale']} skipped_large={bucket['skipped_large']} error={bucket['error']}"
     )
+
+
+def _format_search_results(term: str, mode: str, matches: list[dict], max_items: int = 100) -> str:
+    if not matches:
+        return f"No indexed files matched '{term}'."
+
+    mode_label = {"filename": "filename", "text": "text", "both": "filename or text"}.get(mode, mode)
+    shown = matches[:max_items]
+    lines = [f"Matched {len(matches)} file(s) for '{term}' in {mode_label}:"]
+    for item in shown:
+        rel_path = item["rel_path"]
+        tags = []
+        status = item.get("status")
+        if item.get("filename_match"):
+            tags.append("filename")
+        if item.get("text_match"):
+            tags.append("text")
+        if item.get("section_hits"):
+            tags.append(f"sections={item['section_hits']}")
+        if status and status != "indexed":
+            tags.append(status)
+        best = item.get("best_section_path") or item.get("best_title") or ""
+        suffix = f" ({', '.join(tags)})" if tags else ""
+        if best:
+            lines.append(f"- {rel_path}{suffix} -> {best}")
+        else:
+            lines.append(f"- {rel_path}{suffix}")
+    if len(matches) > max_items:
+        lines.append(f"... ({len(matches) - max_items} more)")
+    return "\n".join(lines)
+
+
+def _format_open_excerpt(excerpt: dict) -> str:
+    header = (
+        f"{excerpt['rel_path']} lines {excerpt['display_start_line']}-{excerpt['display_end_line']} "
+        f"(focus {excerpt['start_line']}-{excerpt['end_line']})"
+    )
+    body_lines = []
+    start = excerpt["display_start_line"]
+    for offset, line in enumerate(excerpt["text"].splitlines(), start=start):
+        marker = ">" if excerpt["start_line"] <= offset <= excerpt["end_line"] else " "
+        body_lines.append(f"{marker} {offset:>5} | {line}")
+    if excerpt["truncated"]:
+        body_lines.append("... [truncated]")
+    return header + "\n" + "\n".join(body_lines)
+
+
+def _format_scope_banner(root_name: str | None) -> str:
+    if not root_name:
+        return ""
+    return f"Scope: {root_name}\n\n"
+
+
+def _parse_root_scope(text: str, cfg) -> tuple[str | None, str]:
+    stripped = text.strip()
+    if not stripped.startswith("@"):
+        return None, stripped
+    token, _, remainder = stripped.partition(" ")
+    root_name = token[1:].strip().lower()
+    valid_roots = {root.name for root in cfg.doc_roots}
+    if not root_name or root_name not in valid_roots:
+        raise ValueError("Unknown doc root. Use /roots to list available roots.")
+    remainder = remainder.strip()
+    if not remainder:
+        raise ValueError(f"Missing query after @{root_name}.")
+    return root_name, remainder
+
+
+def _format_cli_passage_results(query: str, results: dict, root_name: str | None = None) -> str:
+    formatted = format_passage_results(query, results)
+    items = results.get("results", [])
+    if items:
+        formatted += "\n\nUse /open <n> to inspect one of these results."
+    return _format_scope_banner(root_name) + formatted
+
+
+def _run_auto_query(
+    user: str,
+    retrieval: RetrievalService,
+    *,
+    answer_top_k: int,
+    max_sources_chars: int,
+    root_name: str | None = None,
+) -> tuple[str, list[dict]]:
+    intent = detect_query_intent(user)
+    if intent == "passage_search":
+        results = retrieval.retrieve_passages(
+            query=user,
+            top_k=8,
+            include_text=True,
+            max_chars=8000,
+            root_name=root_name,
+        )
+        return _format_cli_passage_results(user, results, root_name=root_name), results.get("results", [])
+
+    answer_payload = retrieval.answer_question(
+        question=user,
+        top_k=answer_top_k,
+        max_sources_chars=max_sources_chars,
+        root_name=root_name,
+    )
+    answer = answer_payload["answer"]
+    if answer.strip() == UNSUPPORTED_ANSWER:
+        results = retrieval.retrieve_passages(
+            query=user,
+            top_k=8,
+            include_text=True,
+            max_chars=8000,
+            root_name=root_name,
+        )
+        return _format_cli_passage_results(user, results, root_name=root_name), results.get("results", [])
+    return _format_scope_banner(root_name) + answer, []
+
+
+_OPEN_RANGE_RE = re.compile(r"^(?P<path>.+?)(?::(?P<start>\d+)(?:-(?P<end>\d+))?)?$")
+
+
+def _parse_open_target(text: str) -> tuple[str, int | None, int | None] | None:
+    spec = text.strip()
+    if not spec:
+        return None
+    m = _OPEN_RANGE_RE.match(spec)
+    if not m:
+        return None
+    rel_path = m.group("path").strip()
+    start = int(m.group("start")) if m.group("start") else None
+    end = int(m.group("end")) if m.group("end") else start
+    return rel_path, start, end
+
+
+def _extract_mention_term(user_text: str) -> tuple[str, str] | None:
+    t = user_text.strip()
+    low = t.lower()
+
+    patterns = [
+        (r"^(?:what|which)\s+files\s+mention\s+(.+?)\s+in\s+(?:the\s+)?filename\??$", "filename"),
+        (r"^(?:what|which)\s+files\s+mention\s+(.+?)\s+in\s+text\??$", "text"),
+        (r"^(?:what|which)\s+files\s+mention\s+(.+?)\??$", "both"),
+        (r"^find\s+files\s+mentioning\s+(.+?)\s+in\s+(?:the\s+)?filename\??$", "filename"),
+        (r"^find\s+files\s+mentioning\s+(.+?)\s+in\s+text\??$", "text"),
+        (r"^find\s+files\s+mentioning\s+(.+?)\??$", "both"),
+    ]
+    for pat, mode in patterns:
+        m = re.match(pat, low, flags=re.IGNORECASE)
+        if m:
+            term = m.group(1).strip().strip("'\"")
+            if term:
+                return term, mode
+    return None
 
 
 def _count_ipv4_addresses(text: str) -> tuple[int, int]:
@@ -732,7 +562,10 @@ def _format_analytic_density_results(cfg, manifest: Manifest, target: str, max_i
     label, counter = analyzers[target]
     rows: list[tuple[str, int, int]] = []
     for rel_path in _list_indexed_files(manifest):
-        abs_path = cfg.doc_root / rel_path
+        try:
+            abs_path = safe_doc_path(cfg.doc_roots, rel_path)
+        except ValueError:
+            continue
         if not abs_path.exists() or not abs_path.is_file():
             continue
         total, unique = counter(_read_note_text(abs_path))
@@ -751,143 +584,109 @@ def _format_analytic_density_results(cfg, manifest: Manifest, target: str, max_i
     return "\n".join(lines)
 
 
-def _handle_meta_query(user_text: str, cfg, manifest: Manifest) -> str | None:
+def _handle_meta_query(
+    user_text: str,
+    cfg,
+    manifest: Manifest,
+    retrieval: RetrievalService,
+    root_name: str | None = None,
+) -> str | None:
     text = user_text.strip()
     low = text.lower()
+
+    indexed_phrases = (
+        "what files have been indexed",
+        "which files have been indexed",
+        "what files are indexed",
+        "which files are indexed",
+        "show indexed files",
+        "list indexed files",
+    )
+    if any(p in low for p in indexed_phrases):
+        files = _list_indexed_files(manifest)
+        if root_name and len(cfg.doc_roots) > 1:
+            files = [p for p in files if p.startswith(f"{root_name}/")]
+        return _format_scope_banner(root_name) + _format_indexed_files(files)
+
+    if low in ("/status", "show index status", "show manifest status", "what failed to index", "which files failed to index"):
+        return _format_manifest_status(manifest)
+
+    if low in ("/roots", "show roots", "show doc roots", "show root counts", "list roots", "list doc roots"):
+        return _format_root_counts(cfg, manifest)
+
+    for root in cfg.doc_roots:
+        root_name = root.name.lower()
+        if low in (
+            f"how many docs in {root_name}",
+            f"how many documents in {root_name}",
+            f"how many files in {root_name}",
+            f"how many docs are in {root_name}",
+            f"how many documents are in {root_name}",
+            f"how many files are in {root_name}",
+            f"how many docs are indexed for {root_name}",
+            f"how many documents are indexed for {root_name}",
+            f"how many files are indexed for {root_name}",
+            f"how many docs were indexed for {root_name}",
+            f"how many documents were indexed for {root_name}",
+            f"how many files were indexed for {root_name}",
+        ):
+            return _format_single_root_count(cfg, manifest, root_name)
 
     analytic_target = _detect_analytic_target(text)
     if analytic_target:
         return _format_analytic_density_results(cfg, manifest, analytic_target)
 
+    mention = _extract_mention_term(text)
+    if mention:
+        term, mode = mention
+        matches = retrieval.search_files(term, mode=mode, limit=100, root_name=root_name)
+        return _format_scope_banner(root_name) + _format_search_results(term, mode, matches)
+
+    if low.startswith("/indexed"):
+        files = _list_indexed_files(manifest)
+        if root_name and len(cfg.doc_roots) > 1:
+            files = [p for p in files if p.startswith(f"{root_name}/")]
+        return _format_scope_banner(root_name) + _format_indexed_files(files)
+
+    if low.startswith("/findfresh "):
+        term = text[11:].strip()
+        mode = "both"
+        matches = retrieval.search_files(term, mode=mode, limit=100, freshness_mode="indexed_only", root_name=root_name)
+        return _format_scope_banner(root_name) + _format_search_results(term, mode, matches)
+
+    if low.startswith("/find "):
+        term = text[6:].strip()
+        mode = "both"
+        matches = retrieval.search_files(term, mode=mode, limit=100, root_name=root_name)
+        return _format_scope_banner(root_name) + _format_search_results(term, mode, matches)
+
+    if low.startswith("/findname "):
+        term = text[10:].strip()
+        matches = retrieval.search_files(term, mode="filename", limit=100, root_name=root_name)
+        return _format_scope_banner(root_name) + _format_search_results(term, "filename", matches)
+
+    if low.startswith("/findtext "):
+        term = text[10:].strip()
+        matches = retrieval.search_files(term, mode="text", limit=100, root_name=root_name)
+        return _format_scope_banner(root_name) + _format_search_results(term, "text", matches)
+
     return None
 
 
-def _safe_doc_path(cfg, rel_path: str) -> Path:
-    root = cfg.doc_root.resolve()
-    candidate = (root / rel_path).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise ValueError("Invalid rel_path outside doc_root")
-    return candidate
-
-
-def _resolve_note_matches(rel_path_hint: str, manifest: Manifest) -> list[str]:
-    hint = rel_path_hint.strip().replace("\\", "/").lstrip("./")
-    if not hint:
-        return []
-
-    hint_low = hint.lower()
-    all_paths = sorted(manifest.all_paths())
-
-    exact_rel = [rel_path for rel_path in all_paths if rel_path.lower() == hint_low]
-    if exact_rel:
-        return exact_rel
-
-    basename = Path(hint).name.lower()
-    exact_basename = [rel_path for rel_path in all_paths if Path(rel_path).name.lower() == basename]
-    if exact_basename:
-        return exact_basename
-
-    suffix_matches = [
-        rel_path
-        for rel_path in all_paths
-        if rel_path.lower() == hint_low or rel_path.lower().endswith("/" + hint_low)
-    ]
-    return suffix_matches
-
-
-def _format_note_contents(rel_path: str, text: str, *, truncated: bool, max_chars: int) -> str:
-    body = text.rstrip("\n")
-    if not body:
-        body = "(file is empty)"
-    if truncated:
-        body += f"\n\n[truncated to first {max_chars} characters]"
-    return f"Contents of {rel_path}:\n\n{body}"
-
-
-def _open_note_from_request(user_text: str, decision, cfg, manifest: Manifest, last_search_hits: list[str]) -> str:
-    max_chars = max(200, int(cfg.max_sources_chars))
-    rel_path: str | None = None
-
-    if decision.note_result_index is not None:
-        if not last_search_hits:
-            return "I do not have a recent search result list to open from yet. Search first or name the file directly."
-        idx = decision.note_result_index
-        if idx < 1 or idx > len(last_search_hits):
-            return f"The last search returned {len(last_search_hits)} result(s), so I cannot open #{idx}."
-        rel_path = last_search_hits[idx - 1]
-    elif decision.note_path_hint:
-        matches = _resolve_note_matches(decision.note_path_hint, manifest)
-        if not matches:
-            return f"No indexed file matched {decision.note_path_hint}."
-        if len(matches) > 1:
-            options = "\n".join(f"- {match}" for match in matches[:10])
-            more = ""
-            if len(matches) > 10:
-                more = f"\n... ({len(matches) - 10} more)"
-            return (
-                f"Multiple indexed files matched {decision.note_path_hint}:\n"
-                f"{options}{more}\n"
-                "Say the full relative path you want to open."
-            )
-        rel_path = matches[0]
-
-    if rel_path is None:
-        return f"I could not determine which note to open from: {user_text}"
-
-    try:
-        abs_path = _safe_doc_path(cfg, rel_path)
-    except ValueError:
-        return f"I could not open {rel_path} because the resolved path is outside the notes directory."
-
-    if not abs_path.exists() or not abs_path.is_file():
-        return f"The indexed file {rel_path} is no longer available on disk. Reindex and try again."
-
-    text = _read_note_text(abs_path)
-    truncated = len(text) > max_chars
-    excerpt = text[:max_chars]
-    return _format_note_contents(rel_path, excerpt, truncated=truncated, max_chars=max_chars)
-
-
-def _run_general_chat(user_text: str, turns: list[ChatTurn], client: OpenAI, cfg) -> str:
-    messages = [{"role": "system", "content": GENERAL_CHAT_PROMPT}]
-    for tr in turns:
-        messages.append({"role": tr.role, "content": tr.content})
-    messages.append({"role": "user", "content": user_text})
-    resp = client.chat.completions.create(
-        model=cfg.chat_model,
-        messages=messages,
-        temperature=0.3,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-
-def _background_index_loop(
-    stop_event: threading.Event,
-    index_lock: threading.Lock,
-    cfg,
-    client,
-    manifest,
-    store,
-    reindex_state: ReindexStatus,
-    reindex_state_lock: threading.Lock,
-):
+def _background_index_loop(stop_event: threading.Event, index_lock: threading.Lock, cfg, client, manifest, store):
     interval = max(1, int(cfg.scan_interval_minutes)) * 60
+    initial_delay = max(0, int(cfg.background_index_start_delay_seconds))
+    slept = 0
+    while slept < initial_delay and not stop_event.is_set():
+        time.sleep(1)
+        slept += 1
+
     while not stop_event.is_set():
         try:
             with index_lock:
-                _set_reindex_status(
-                    reindex_state,
-                    reindex_state_lock,
-                    running=True,
-                    owner="background",
-                    mode="incremental",
-                    phase="starting",
-                    status="starting",
-                    started_at=time.time(),
-                )
                 stats = run_index_once(
                     client=client,
-                    doc_root=cfg.doc_root,
+                    doc_roots=cfg.doc_roots,
                     include_ext=cfg.include_ext,
                     manifest=manifest,
                     store=store,
@@ -896,30 +695,10 @@ def _background_index_loop(
                     chunk_overlap=cfg.chunk_overlap,
                     max_file_size_mb=cfg.max_file_size_mb,
                     max_chunks_per_file=cfg.max_chunks_per_file,
-                    progress_callback=_make_background_progress_callback("index-bg", reindex_state, reindex_state_lock),
-                )
-                _set_reindex_status(
-                    reindex_state,
-                    reindex_state_lock,
-                    running=False,
-                    owner="",
-                    mode="incremental",
-                    phase="idle",
-                    status="idle",
-                    current_file="",
-                    current_index=0,
-                    total_files=0,
+                    retry_error_after_minutes=cfg.retry_error_after_minutes,
+                    progress_callback=_make_background_progress_callback("index-bg"),
                 )
         except Exception as e:
-            _set_reindex_status(
-                reindex_state,
-                reindex_state_lock,
-                running=False,
-                owner="",
-                phase="error",
-                status="error",
-                errors=reindex_state.errors + 1,
-            )
             print(f"\n[index] error: {e}\n")
 
         slept = 0
@@ -928,35 +707,47 @@ def _background_index_loop(
             slept += 1
 
 
-def main(config_path: str | Path = "config.yaml"):
+def main(config_path: str | Path = "config.yaml", enable_background: bool = True):
     cfg = load_config(config_path)
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    validate_runtime_config(cfg)
 
     client = OpenAI()
     manifest = Manifest(cfg.manifest_path)
     store = VectorStore(cfg.index_dir, collection_name="notes")
+    retrieval = RetrievalService(
+        store=store,
+        manifest=manifest,
+        client=client,
+        embedding_model=cfg.embedding_model,
+        chat_model=cfg.chat_model,
+        doc_roots=cfg.doc_roots,
+        answer_context_before_lines=cfg.answer_context_before_lines,
+        answer_context_after_lines=cfg.answer_context_after_lines,
+        adjacent_chunk_window=cfg.adjacent_chunk_window,
+    )
 
     history_store = ChatHistory(cfg.chat_history_path)
     turns = history_store.load()
-    search_log_path = cfg.data_dir / "search_queries.jsonl"
-    last_search_hits: list[str] = []
 
     stop_event = threading.Event()
     index_lock = threading.Lock()
-    reindex_state = ReindexStatus()
-    reindex_state_lock = threading.Lock()
 
-    t = threading.Thread(
-        target=_background_index_loop,
-        args=(stop_event, index_lock, cfg, client, manifest, store, reindex_state, reindex_state_lock),
-        daemon=True
-    )
-    t.start()
+    if enable_background:
+        t = threading.Thread(
+            target=_background_index_loop,
+            args=(stop_event, index_lock, cfg, client, manifest, store),
+            daemon=True
+        )
+        t.start()
 
     print("Notes bot ready.")
-    print("Ask naturally about your notes or ask general questions.")
-    print("Commands: /help, /clear, /reindex, /reindex-force, /reindex-status, /eval-candidates, /eval-promote, /indexed, /exit")
-    print("Indexing runs in the background periodically.\n")
+    print("Commands: /clear, /reindex, /indexed, /roots, /status, /find <term>, /findfresh <term>, /findname <term>, /findtext <term>, /search <term>, /searchfresh <term>, /open <...>, /exit")
+    if enable_background:
+        print("Indexing runs in the background periodically.\n")
+    else:
+        print("Background indexing disabled for this session.\n")
+    last_search_results: list[dict] = []
 
     def recent_turns():
         return turns[-2 * cfg.max_history_turns:] if cfg.max_history_turns > 0 else []
@@ -971,133 +762,138 @@ def main(config_path: str | Path = "config.yaml"):
             if not user:
                 continue
 
-            decision = route_user_input(user)
+            try:
+                root_name, scoped_user = _parse_root_scope(user, cfg)
+            except ValueError as e:
+                print(f"{e}\n")
+                continue
 
-            if decision.mode == "command":
-                if decision.command_name == "exit":
-                    break
+            if scoped_user.lower() == "/exit":
+                break
 
-                if decision.command_name == "help":
-                    print("\n" + HELP_TEXT)
-                    continue
+            if scoped_user.lower() == "/help":
+                print("\n" + HELP_TEXT)
+                continue
 
-                if decision.command_name == "clear":
-                    turns.clear()
-                    history_store.clear()
-                    last_search_hits.clear()
-                    print("Cleared chat context.\n")
-                    continue
+            if scoped_user.lower() == "/clear":
+                turns.clear()
+                history_store.clear()
+                print("Cleared chat context.\n")
+                continue
 
-                if decision.command_name == "indexed":
-                    indexed_text = _format_indexed_files(_list_indexed_files(manifest))
-                    print("\n" + indexed_text + "\n")
-                    turns.append(ChatTurn(role="user", content=user, ts=time.time()))
-                    turns.append(ChatTurn(role="assistant", content=indexed_text, ts=time.time()))
-                    history_store.append("user", user)
-                    history_store.append("assistant", indexed_text)
-                    continue
-
-                if decision.command_name == "reindex_status":
-                    status_text = _format_reindex_status(_get_reindex_status(reindex_state, reindex_state_lock))
-                    print("\n" + status_text + "\n")
-                    turns.append(ChatTurn(role="user", content=user, ts=time.time()))
-                    turns.append(ChatTurn(role="assistant", content=status_text, ts=time.time()))
-                    history_store.append("user", user)
-                    history_store.append("assistant", status_text)
-                    continue
-
-                if decision.command_name == "eval_candidates":
-                    candidate_text = _format_eval_candidates(_refresh_eval_candidates(cfg))
-                    print("\n" + candidate_text + "\n")
-                    turns.append(ChatTurn(role="user", content=user, ts=time.time()))
-                    turns.append(ChatTurn(role="assistant", content=candidate_text, ts=time.time()))
-                    history_store.append("user", user)
-                    history_store.append("assistant", candidate_text)
-                    continue
-
-                if decision.command_name == "eval_promote":
-                    promote_text = _promote_eval_candidates_from_text(user, cfg)
-                    print("\n" + promote_text + "\n")
-                    turns.append(ChatTurn(role="user", content=user, ts=time.time()))
-                    turns.append(ChatTurn(role="assistant", content=promote_text, ts=time.time()))
-                    history_store.append("user", user)
-                    history_store.append("assistant", promote_text)
-                    continue
-
-                if decision.command_name not in ("reindex", "reindex_force"):
-                    print("\nUnknown command.\n")
-                    continue
-
-                is_force = decision.command_name == "reindex_force"
-                if is_force:
-                    print("Reindexing (full rebuild) ...")
-                else:
-                    print("Reindexing (incremental) ...")
+            if scoped_user.lower() == "/reindex":
+                print("Reindexing (incremental) ...")
                 locked = index_lock.acquire(blocking=False)
                 if not locked:
                     print("Indexer is busy in background; waiting for current pass to finish ...")
-                    wait_start = time.time()
-                    last_wait_emit = 0.0
-                    while True:
-                        locked = index_lock.acquire(timeout=1.0)
-                        if locked:
-                            break
-                        now = time.time()
-                        if (now - last_wait_emit) >= 2.0:
-                            st = _get_reindex_status(reindex_state, reindex_state_lock)
-                            waited = _fmt_seconds(now - wait_start)
-                            location = st.current_file[:80] if st.current_file else "<starting>"
-                            progress = f"{st.current_index}/{st.total_files}" if st.total_files > 0 else "--/--"
-                            print(
-                                f"[wait] owner={st.owner or 'unknown'} mode={st.mode} phase={st.phase} "
-                                f"status={st.status} progress={progress} waited={waited} "
-                                f"u={st.updated} d={st.deleted} e={st.errors} file={location}",
-                                flush=True,
-                            )
-                            last_wait_emit = now
+                    index_lock.acquire()
                 try:
-                    _set_reindex_status(
-                        reindex_state,
-                        reindex_state_lock,
-                        running=True,
-                        owner="manual",
-                        mode="full" if is_force else "incremental",
-                        phase="starting",
-                        status="starting",
-                        started_at=time.time(),
-                    )
-                    stats = run_index_once(
-                        client=client,
-                        doc_root=cfg.doc_root,
-                        include_ext=cfg.include_ext,
-                        manifest=manifest,
-                        store=store,
-                        embedding_model=cfg.embedding_model,
-                        chunk_chars=cfg.chunk_chars,
-                        chunk_overlap=cfg.chunk_overlap,
-                        max_file_size_mb=cfg.max_file_size_mb,
-                        max_chunks_per_file=cfg.max_chunks_per_file,
-                        force_reindex=is_force,
-                        progress_callback=_make_progress_callback("reindex", reindex_state, reindex_state_lock),
-                    )
+                    try:
+                        stats = run_index_once(
+                            client=client,
+                            doc_roots=cfg.doc_roots,
+                            include_ext=cfg.include_ext,
+                            manifest=manifest,
+                            store=store,
+                            embedding_model=cfg.embedding_model,
+                            chunk_chars=cfg.chunk_chars,
+                            chunk_overlap=cfg.chunk_overlap,
+                            max_file_size_mb=cfg.max_file_size_mb,
+                            max_chunks_per_file=cfg.max_chunks_per_file,
+                            retry_error_after_minutes=0,
+                            progress_callback=_make_progress_callback("reindex"),
+                        )
+                    except Exception as e:
+                        print(f"Reindex failed: {e}\n")
+                        continue
                 finally:
-                    _set_reindex_status(
-                        reindex_state,
-                        reindex_state_lock,
-                        running=False,
-                        owner="",
-                        mode="incremental",
-                        phase="idle",
-                        status="idle",
-                        current_file="",
-                        current_index=0,
-                        total_files=0,
-                    )
                     index_lock.release()
                 print(f"Done. scanned={stats.scanned} updated={stats.updated} deleted={stats.deleted} errors={stats.errors}\n")
                 continue
 
-            meta_answer = _handle_meta_query(user, cfg, manifest)
+            if scoped_user.lower().startswith("/search "):
+                query_text = scoped_user[8:].strip()
+                if not query_text:
+                    print("Usage: /search <term>\n")
+                    continue
+                results = retrieval.retrieve_passages(
+                    query=query_text,
+                    top_k=8,
+                    include_text=True,
+                    max_chars=8000,
+                    root_name=root_name,
+                )
+                last_search_results = results.get("results", [])
+                print("\n" + _format_cli_passage_results(query_text, results, root_name=root_name) + "\n")
+                continue
+
+            if scoped_user.lower().startswith("/searchfresh "):
+                query_text = scoped_user[13:].strip()
+                if not query_text:
+                    print("Usage: /searchfresh <term>\n")
+                    continue
+                results = retrieval.retrieve_passages(
+                    query=query_text,
+                    top_k=8,
+                    include_text=True,
+                    max_chars=8000,
+                    freshness_mode="indexed_only",
+                    root_name=root_name,
+                )
+                last_search_results = results.get("results", [])
+                print("\n" + _format_cli_passage_results(query_text, results, root_name=root_name) + "\n")
+                continue
+
+            if scoped_user.lower().startswith("/open "):
+                spec = scoped_user[6:].strip()
+                if not spec:
+                    print("Usage: /open <n> or /open <path[:start-end]>\n")
+                    continue
+
+                excerpt = None
+                if spec.isdigit():
+                    idx = int(spec)
+                    if idx < 1 or idx > len(last_search_results):
+                        print("No such search result. Run /search first and choose a listed result number.\n")
+                        continue
+                    item = last_search_results[idx - 1]
+                    try:
+                        excerpt = get_note_excerpt(
+                            doc_roots=cfg.doc_roots,
+                            rel_path=item["rel_path"],
+                            start_line=item.get("start_line"),
+                            end_line=item.get("end_line"),
+                            context_before=12,
+                            context_after=12,
+                            max_chars=120000,
+                        )
+                    except Exception as e:
+                        print(f"Failed to open result {idx}: {e}\n")
+                        continue
+                else:
+                    parsed = _parse_open_target(spec)
+                    if not parsed:
+                        print("Usage: /open <n> or /open <path[:start-end]>\n")
+                        continue
+                    rel_path, start_line, end_line = parsed
+                    try:
+                        excerpt = get_note_excerpt(
+                            doc_roots=cfg.doc_roots,
+                            rel_path=rel_path,
+                            start_line=start_line,
+                            end_line=end_line,
+                            context_before=12,
+                            context_after=12,
+                            max_chars=120000,
+                        )
+                    except Exception as e:
+                        print(f"Failed to open note: {e}\n")
+                        continue
+
+                print("\n" + _format_open_excerpt(excerpt) + "\n")
+                continue
+
+            meta_answer = _handle_meta_query(scoped_user, cfg, manifest, retrieval, root_name=root_name)
             if meta_answer is not None:
                 print("\n" + meta_answer + "\n")
                 turns.append(ChatTurn(role="user", content=user, ts=time.time()))
@@ -1106,25 +902,13 @@ def main(config_path: str | Path = "config.yaml"):
                 history_store.append("assistant", meta_answer)
                 continue
 
-            if decision.mode == "note_open":
-                answer = _open_note_from_request(user, decision, cfg, manifest, last_search_hits)
-            elif decision.mode == "notes_search":
-                results = search_notes(
-                    query=user,
-                    client=client,
-                    cfg=cfg,
-                    manifest=manifest,
-                    store=store,
-                    limit=cfg.top_k,
-                )
-                try:
-                    append_search_log(search_log_path, query=user, results=results)
-                except OSError:
-                    pass
-                last_search_hits = [hit.rel_path for hit in results.hits]
-                answer = format_search_results(results)
-            else:
-                answer = _run_general_chat(user, recent_turns(), client, cfg)
+            answer, last_search_results = _run_auto_query(
+                scoped_user,
+                retrieval,
+                answer_top_k=cfg.top_k,
+                max_sources_chars=cfg.max_sources_chars,
+                root_name=root_name,
+            )
 
             print("\n" + answer + "\n")
 

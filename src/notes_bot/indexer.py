@@ -2,17 +2,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
+import time
 from typing import Callable, Iterable
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+)
 
-from .manifest import Manifest, FileState
+from .doc_roots import DocRoot
+from .manifest import Manifest
 from .scanner import iter_files, DiscoveredFile
 from .chunker import chunk_with_line_ranges
 from .store import VectorStore
-
-INDEX_SCHEMA_VERSION = "2"
-
 
 @dataclass
 class IndexStats:
@@ -35,32 +42,119 @@ def _embed_texts(client: OpenAI, model: str, texts: list[str]) -> list[list[floa
     return [d.embedding for d in resp.data]
 
 
-def _extract_heading_context(lines: list[str], start_line: int) -> str | None:
-    if start_line <= 1:
-        search_end = 0
-    else:
-        search_end = min(len(lines), start_line - 1)
-
-    for idx in range(search_end - 1, -1, -1):
-        stripped = lines[idx].strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            return stripped.lstrip("#").strip() or None
-    return None
+def _is_changed_file(f: DiscoveredFile, manifest: Manifest) -> bool:
+    prev = manifest.get(f.rel_path)
+    return (
+        (prev is None)
+        or (prev.mtime != f.mtime)
+        or (prev.size != f.size)
+        or (prev.status in ("error", "stale"))
+    )
 
 
-def _extract_first_nonempty_line(text: str) -> str | None:
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped[:200]
-    return None
+def _should_retry_error(prev, retry_error_after_minutes: int) -> bool:
+    if prev is None or prev.status != "error":
+        return False
+    if int(retry_error_after_minutes) <= 0:
+        return True
+    retry_after_seconds = max(1, int(retry_error_after_minutes)) * 60
+    last_attempt_at = prev.last_indexed_at or prev.updated_at or 0.0
+    if last_attempt_at <= 0:
+        return True
+    return (time.time() - last_attempt_at) >= retry_after_seconds
+
+
+def should_reindex_file(
+    f: DiscoveredFile,
+    manifest: Manifest,
+    *,
+    retry_error_after_minutes: int,
+) -> bool:
+    prev = manifest.get(f.rel_path)
+    if prev is None:
+        return True
+    if prev.mtime != f.mtime or prev.size != f.size:
+        return True
+    if prev.status == "stale":
+        return True
+    if prev.status == "error":
+        return _should_retry_error(prev, retry_error_after_minutes)
+    return False
+
+
+def _detail_from_openai_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        return ""
+    low = message.lower()
+    if low.startswith("error code:"):
+        return ""
+    return message
+
+
+def _format_embedding_preflight_error(exc: Exception, model: str) -> str:
+    detail = _detail_from_openai_error(exc)
+    suffix = f" Detail: {detail}" if detail else ""
+
+    if isinstance(exc, PermissionDeniedError):
+        return (
+            f"Embedding access denied for model '{model}'. "
+            f"Check that your API key/project has access to this embedding model, "
+            f"or change 'embedding_model' in config.yaml.{suffix}"
+        )
+    if isinstance(exc, AuthenticationError):
+        return f"OpenAI authentication failed while validating embedding model '{model}'.{suffix}"
+    if isinstance(exc, NotFoundError):
+        return (
+            f"Embedding model '{model}' was not found. "
+            f"Update 'embedding_model' in config.yaml to a valid model name.{suffix}"
+        )
+    if isinstance(exc, BadRequestError):
+        return f"Embedding request was rejected for model '{model}'. Check the configured model name.{suffix}"
+    if isinstance(exc, APIConnectionError):
+        return (
+            f"Could not reach the OpenAI embeddings API for model '{model}'. "
+            f"Check network access and try again.{suffix}"
+        )
+    if isinstance(exc, APIStatusError):
+        return f"OpenAI returned HTTP {exc.status_code} while validating embedding model '{model}'.{suffix}"
+    return f"Failed to validate embedding model '{model}'.{suffix}"
+
+
+def _preflight_embedding_access(client: OpenAI, model: str) -> None:
+    try:
+        client.embeddings.create(model=model, input=["healthcheck"])
+    except Exception as exc:
+        raise RuntimeError(_format_embedding_preflight_error(exc, model)) from exc
+
+
+def _empty_embeddings(count: int) -> list[list[float]]:
+    return [[] for _ in range(max(0, count))]
+
+
+def _mark_searchable_state(
+    manifest: Manifest,
+    rel_path: str,
+    mtime: float,
+    size: int,
+    chunk_count: int,
+) -> None:
+    now = time.time()
+    manifest.mark_status(
+        rel_path=rel_path,
+        mtime=mtime,
+        size=size,
+        status="indexed",
+        last_error="",
+        chunk_count=chunk_count,
+        last_indexed_at=now,
+        last_success_at=now,
+    )
 
 def run_index_once(
     *,
     client: OpenAI,
-    doc_root: Path,
+    doc_roots: tuple[DocRoot, ...],
     include_ext: tuple[str, ...],
     manifest: Manifest,
     store: VectorStore,
@@ -70,40 +164,53 @@ def run_index_once(
     batch_size: int = 96,
     max_file_size_mb: int = 8,
     max_chunks_per_file: int = 2000,
-    force_reindex: bool = False,
+    retry_error_after_minutes: int = 60,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> IndexStats:
     stats = IndexStats()
     seen_paths: set[str] = set()
-    files = list(iter_files(doc_root, include_ext))
+    files = list(iter_files(doc_roots, include_ext))
     total_files = len(files)
-    stored_schema_version = manifest.get_meta("index_schema_version")
-    schema_force_reindex = stored_schema_version != INDEX_SCHEMA_VERSION
-    effective_force_reindex = force_reindex or schema_force_reindex
+    pending_files = [
+        f for f in files
+        if should_reindex_file(
+            f,
+            manifest,
+            retry_error_after_minutes=retry_error_after_minutes,
+        )
+    ]
+    embeddings_enabled = True
 
-    if effective_force_reindex and progress_callback:
-        progress_callback({
-            "phase": "schema_upgrade",
-            "reason": "schema_upgrade" if schema_force_reindex else "manual_force",
-            "old_version": stored_schema_version or "unset",
-            "new_version": INDEX_SCHEMA_VERSION,
-            "total_files": total_files,
-        })
+    if pending_files:
+        try:
+            _preflight_embedding_access(client, embedding_model)
+        except RuntimeError as exc:
+            embeddings_enabled = False
+            if progress_callback:
+                progress_callback({
+                    "phase": "warning",
+                    "status": "embedding_unavailable",
+                    "error": str(exc),
+                })
 
     for idx, f in enumerate(files, start=1):
         stats.scanned += 1
         seen_paths.add(f.rel_path)
+        inserted_ids: list[str] = []
 
         prev = manifest.get(f.rel_path)
-        changed = effective_force_reindex or (prev is None) or (prev.mtime != f.mtime) or (prev.size != f.size)
+        changed = should_reindex_file(
+            f,
+            manifest,
+            retry_error_after_minutes=retry_error_after_minutes,
+        )
         if progress_callback:
             progress_callback({
                 "phase": "scan",
                 "index": idx,
                 "total": total_files,
                 "rel_path": f.rel_path,
-                "status": "reindex_all" if effective_force_reindex else ("updating" if changed else "unchanged"),
-                "mode": "full" if effective_force_reindex else "incremental",
+                "status": "updating" if changed else "unchanged",
                 "stats": stats,
             })
         if not changed:
@@ -121,6 +228,16 @@ def run_index_once(
                 })
             file_size_mb = f.size / (1024 * 1024)
             if file_size_mb > max_file_size_mb:
+                store.delete_file(f.rel_path)
+                manifest.mark_status(
+                    rel_path=f.rel_path,
+                    mtime=f.mtime,
+                    size=f.size,
+                    status="skipped_large",
+                    last_error=f"file exceeds max size of {max_file_size_mb}MB",
+                    chunk_count=0,
+                    last_success_at=prev.last_success_at if prev is not None else 0.0,
+                )
                 stats.errors += 1
                 if progress_callback:
                     progress_callback({
@@ -136,7 +253,6 @@ def run_index_once(
                 continue
 
             text = _read_text(f.abs_path)
-            lines = text.splitlines()
             if progress_callback:
                 progress_callback({
                     "phase": "file",
@@ -171,28 +287,6 @@ def run_index_once(
                     "stats": stats,
                 })
 
-            # Replace all chunks for this file
-            if progress_callback:
-                progress_callback({
-                    "phase": "file",
-                    "index": idx,
-                    "total": total_files,
-                    "rel_path": f.rel_path,
-                    "status": "delete_start",
-                    "stats": stats,
-                })
-            store.delete_file(f.rel_path)
-            if progress_callback:
-                progress_callback({
-                    "phase": "file",
-                    "index": idx,
-                    "total": total_files,
-                    "rel_path": f.rel_path,
-                    "status": "delete_done",
-                    "stats": stats,
-                })
-
-            # Embed + upsert in bounded-memory batches
             total_chunks = len(chunks)
             total_batches = max(1, (total_chunks + batch_size - 1) // batch_size) if total_chunks else 0
             if progress_callback:
@@ -210,25 +304,32 @@ def run_index_once(
             batch_ids: list[str] = []
             batch_texts: list[str] = []
             batch_metas: list[dict] = []
+            all_ids: list[str] = []
+            all_texts: list[str] = []
+            all_metas: list[dict] = []
             batch_no = 0
-
             for ch in chunks:
-                heading = _extract_heading_context(lines, ch.start_line)
-                first_line = _extract_first_nonempty_line(ch.text)
-                batch_ids.append(_stable_chunk_id(f.rel_path, f.mtime, ch.chunk_index))
-                batch_texts.append(ch.text)
-                batch_metas.append({
+                chunk_id = _stable_chunk_id(f.rel_path, f.mtime, ch.chunk_index)
+                meta = {
                     "rel_path": f.rel_path,
-                    "basename": f.abs_path.name,
-                    "stem": f.abs_path.stem,
                     "start_line": ch.start_line,
                     "end_line": ch.end_line,
                     "chunk_index": ch.chunk_index,
+                    "content_type": ch.content_type,
+                    "title": ch.title,
+                    "section_path": ch.section_path,
                     "mtime": f.mtime,
-                    "heading": heading,
-                    "first_line": first_line,
-                })
+                }
+                all_ids.append(chunk_id)
+                all_texts.append(ch.text)
+                all_metas.append(meta)
+                batch_ids.append(chunk_id)
+                batch_texts.append(ch.text)
+                batch_metas.append(meta)
                 if len(batch_texts) < batch_size:
+                    continue
+
+                if not embeddings_enabled:
                     continue
 
                 batch_no += 1
@@ -244,18 +345,22 @@ def run_index_once(
                         "batch_size": len(batch_texts),
                         "stats": stats,
                     })
-                be = _embed_texts(client, embedding_model, batch_texts)
-                store.add_chunks(
-                    ids=batch_ids,
-                    texts=batch_texts,
-                    embeddings=be,
-                    metadatas=batch_metas,
-                )
-                batch_ids.clear()
-                batch_texts.clear()
-                batch_metas.clear()
+                try:
+                    be = _embed_texts(client, embedding_model, batch_texts)
+                    store.add_chunks(
+                        ids=batch_ids,
+                        texts=batch_texts,
+                        embeddings=be,
+                        metadatas=batch_metas,
+                    )
+                    inserted_ids.extend(batch_ids)
+                    batch_ids.clear()
+                    batch_texts.clear()
+                    batch_metas.clear()
+                except Exception:
+                    embeddings_enabled = False
 
-            if batch_texts:
+            if embeddings_enabled and batch_texts:
                 batch_no += 1
                 if progress_callback:
                     progress_callback({
@@ -269,15 +374,51 @@ def run_index_once(
                         "batch_size": len(batch_texts),
                         "stats": stats,
                     })
-                be = _embed_texts(client, embedding_model, batch_texts)
-                store.add_chunks(
-                    ids=batch_ids,
-                    texts=batch_texts,
-                    embeddings=be,
-                    metadatas=batch_metas,
-                )
+                try:
+                    be = _embed_texts(client, embedding_model, batch_texts)
+                    store.add_chunks(
+                        ids=batch_ids,
+                        texts=batch_texts,
+                        embeddings=be,
+                        metadatas=batch_metas,
+                    )
+                    inserted_ids.extend(batch_ids)
+                except Exception:
+                    embeddings_enabled = False
 
-            manifest.upsert(FileState(rel_path=f.rel_path, mtime=f.mtime, size=f.size))
+            if not embeddings_enabled and all_ids:
+                if inserted_ids:
+                    store.delete_ids(inserted_ids)
+                    inserted_ids.clear()
+                if progress_callback:
+                    progress_callback({
+                        "phase": "file",
+                        "index": idx,
+                        "total": total_files,
+                        "rel_path": f.rel_path,
+                        "status": "lexical_only",
+                        "chunks": total_chunks,
+                        "stats": stats,
+                    })
+                store.add_chunks(
+                    ids=all_ids,
+                    texts=all_texts,
+                    embeddings=_empty_embeddings(len(all_ids)),
+                    metadatas=all_metas,
+                )
+                inserted_ids.extend(all_ids)
+
+            if progress_callback:
+                progress_callback({
+                    "phase": "file",
+                    "index": idx,
+                    "total": total_files,
+                    "rel_path": f.rel_path,
+                    "status": "delete_old",
+                    "stats": stats,
+                })
+            store.delete_file_except(f.rel_path, inserted_ids)
+            _mark_searchable_state(manifest, f.rel_path, f.mtime, f.size, total_chunks)
             stats.updated += 1
             if progress_callback:
                 progress_callback({
@@ -290,7 +431,29 @@ def run_index_once(
                 })
 
         except Exception as e:
+            if inserted_ids:
+                store.delete_ids(inserted_ids)
             stats.errors += 1
+            if prev is not None and prev.status in ("indexed", "stale"):
+                manifest.mark_status(
+                    rel_path=f.rel_path,
+                    mtime=prev.mtime,
+                    size=prev.size,
+                    status="stale",
+                    last_error=str(e),
+                    chunk_count=prev.chunk_count,
+                    last_success_at=prev.last_success_at,
+                )
+            else:
+                manifest.mark_status(
+                    rel_path=f.rel_path,
+                    mtime=f.mtime,
+                    size=f.size,
+                    status="error",
+                    last_error=str(e),
+                    chunk_count=0,
+                    last_success_at=0.0,
+                )
             if progress_callback:
                 progress_callback({
                     "phase": "scan",
@@ -326,12 +489,7 @@ def run_index_once(
             "stats": stats,
             "total_files": total_files,
             "deleted_total": len(missing_list),
-            "schema_version": INDEX_SCHEMA_VERSION,
-            "force_reindex": effective_force_reindex,
         })
-
-    if stats.errors == 0:
-        manifest.set_meta("index_schema_version", INDEX_SCHEMA_VERSION)
 
     return stats
     

@@ -1,21 +1,31 @@
-doc_root: "/home/kspringall/omv-documents/TextSync"          # change to your mounted SMB path
+doc_roots:
+  - name: personal1
+    path: /home/kspringall/omv-docs/yt-get-transcripts/transcripts/Formatted
+  - name: personal2
+    path: /home/kspringall/omv-docs/TextSync
+
 include_ext: [".md", ".txt"]
 
-data_dir: "/home/kspringall/code/notes_bot/data"
-index_dir: "/home/kspringall/code/notes_bot/data/chroma"
-manifest_path: "/home/kspringall/code/notes_bot/data/manifest.sqlite"
-chat_history_path: "/home/kspringall/code/notes_bot/data/chat_history.jsonl"
+data_dir: "./data"
+index_dir: "./data/chroma"
+manifest_path: "./data/manifest.sqlite"
+chat_history_path: "./data/chat_history.jsonl"
 
 chunk_chars: 4000
 chunk_overlap: 500
 top_k: 10
 
 scan_interval_minutes: 15
+background_index_start_delay_seconds: 300
+retry_error_after_minutes: 60
 
 embedding_model: "text-embedding-3-small"
-chat_model: "gpt-5.2"
+chat_model: "gpt-5.4"
 
 max_history_turns: 12
 max_sources_chars: 35000
+answer_context_before_lines: 8
+answer_context_after_lines: 8
+adjacent_chunk_window: 1
 max_file_size_mb: 8
 max_chunks_per_file: 2000
